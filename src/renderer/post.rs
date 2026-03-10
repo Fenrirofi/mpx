@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 
 /// Parameters sent to the composite shader.
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PostParams {
     pub bloom_strength:      f32,
     pub exposure:            f32,
@@ -22,18 +22,16 @@ pub struct PostParams {
 impl Default for PostParams {
     fn default() -> Self {
         Self {
-            bloom_strength:      0.04,
-            exposure:            0.3,
+            bloom_strength:      0.0,
+            exposure:            0.0,
             ca_strength:         0.4,
             vignette_strength:   0.45,
             vignette_radius:     0.75,
             vignette_smoothness: 0.4,
-            grain_strength:      0.5,
+            grain_strength:      0.02,
             time:                0.0,
-            ssao_strength: 1.0,
-            _pad0: 0.0,
-            _pad1: 0.0,
-            _pad2: 0.0,
+            ssao_strength:       0.7,
+            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
         }
     }
 }
@@ -231,10 +229,10 @@ impl PostProcessor {
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None }, count: None },
+                // binding 4: SSAO texture
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
-
             ],
         });
 
@@ -340,7 +338,7 @@ impl PostProcessor {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.bloom_a_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.linear_sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: self.post_params_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ssao_view) }, // ← nowe
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ssao_view) },
             ],
         });
         self.run_pass(encoder, &self.composite_pipeline, &comp_bg, output_view);

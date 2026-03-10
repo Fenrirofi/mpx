@@ -138,7 +138,7 @@ impl RenderContext {
     pub async fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(), ..Default::default()
+            backends: wgpu::Backends::VULKAN, ..Default::default()
         });
         let surface = instance.create_surface(Arc::clone(&window))?;
         let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {

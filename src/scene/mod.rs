@@ -10,7 +10,6 @@ use glam::Vec3;
 
 pub struct Scene {
     pub camera:            Camera,
-    pub camera_controller: CameraController,
     pub objects:           Vec<SceneObject>,
     pub lights:            Vec<Light>,
     pub ambient_color:     Vec3,
@@ -28,14 +27,14 @@ impl Scene {
         let objects = vec![
             // Gold metallic sphere
             SceneObject {
-                mesh:      Mesh::uv_sphere(32, 32),
-                material:  Material::metallic(Vec4::new(1.0, 0.78, 0.34, 1.0), 0.1),
+                mesh:      Mesh::uv_sphere(64, 64),
+                material:  Material::dielectric(Vec4::new(0.95, 0.75, 0.2, 1.0), 0.4),
                 transform: Transform::identity(),
             },
             // Rough dielectric sphere
             SceneObject {
-                mesh:      Mesh::uv_sphere(32, 32),
-                material:  Material::dielectric(Vec4::new(0.2, 0.4, 0.9, 1.0), 0.6),
+                mesh:      Mesh::uv_sphere(64, 64),
+                material:  Material::dielectric(Vec4::new(0.1, 0.35, 0.85, 1.0), 0.7),
                 transform: {
                     let mut t = Transform::identity();
                     t.set_translation(vec3(2.5, 0.0, 0.0));
@@ -44,8 +43,8 @@ impl Scene {
             },
             // Smooth plastic sphere
             SceneObject {
-                mesh:      Mesh::uv_sphere(32, 32),
-                material:  Material::dielectric(Vec4::new(0.9, 0.15, 0.1, 1.0), 0.2),
+                mesh:      Mesh::uv_sphere(64, 64),
+                material:  Material::dielectric(Vec4::new(0.85, 0.12, 0.08, 1.0), 0.5),
                 transform: {
                     let mut t = Transform::identity();
                     t.set_translation(vec3(-2.5, 0.0, 0.0));
@@ -76,15 +75,10 @@ impl Scene {
 
         Self {
             camera,
-            camera_controller: CameraController::new(4.0, 0.3),
             objects,
             lights,
             ambient_color:     Vec3::new(0.08, 0.12, 0.22),
             ambient_intensity: 1.4,
         }
-    }
-
-    pub fn update(&mut self) {
-        self.camera_controller.update_camera(&mut self.camera);
     }
 }

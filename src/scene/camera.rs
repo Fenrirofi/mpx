@@ -1,160 +1,181 @@
 use glam::{Mat4, Vec3};
 use winit::{
-    event::{ElementState, KeyEvent},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta},
     keyboard::{KeyCode, PhysicalKey},
 };
 
-/// Perspective camera with cached view/projection matrices.
 pub struct Camera {
-    pub position: Vec3,
-    pub target: Vec3,
-    pub up: Vec3,
+    pub position:      Vec3,
+    pub target:        Vec3,
+    pub up:            Vec3,
     pub fov_y_radians: f32,
-    pub aspect: f32,
-    pub near: f32,
-    pub far: f32,
-    view: Mat4,
-    proj: Mat4,
-    view_proj: Mat4,
-    dirty: bool,
+    pub aspect:        f32,
+    pub near:          f32,
+    pub far:           f32,
+    view:              Mat4,
+    proj:              Mat4,
+    view_proj:         Mat4,
+    pub dirty:         bool,
 }
 
 impl Camera {
     pub fn new(position: Vec3, target: Vec3, aspect: f32) -> Self {
-        let fov = std::f32::consts::FRAC_PI_4;
-        let near = 0.1;
-        let far = 500.0;
+        let fov  = std::f32::consts::FRAC_PI_4;
+        let near = 0.05;
+        let far  = 1000.0;
         let view = Mat4::look_at_rh(position, target, Vec3::Y);
         let proj = Mat4::perspective_rh(fov, aspect, near, far);
         Self {
-            position,
-            target,
-            up: Vec3::Y,
-            fov_y_radians: fov,
-            aspect,
-            near,
-            far,
-            view,
-            proj,
-            view_proj: proj * view,
-            dirty: false,
+            position, target, up: Vec3::Y,
+            fov_y_radians: fov, aspect, near, far,
+            view, proj, view_proj: proj * view, dirty: false,
         }
     }
 
-    pub fn set_aspect(&mut self, aspect: f32) {
-        self.aspect = aspect;
-        self.dirty = true;
-    }
+    pub fn set_aspect(&mut self, aspect: f32) { self.aspect = aspect; self.dirty = true; }
 
-    /// Rebuild matrices only when dirty.
     pub fn rebuild_if_dirty(&mut self) {
         if self.dirty {
-            self.view = Mat4::look_at_rh(self.position, self.target, self.up);
-            self.proj = Mat4::perspective_rh(self.fov_y_radians, self.aspect, self.near, self.far);
+            self.view      = Mat4::look_at_rh(self.position, self.target, Vec3::Y);
+            self.proj      = Mat4::perspective_rh(self.fov_y_radians, self.aspect, self.near, self.far);
             self.view_proj = self.proj * self.view;
-            self.dirty = false;
+            self.dirty     = false;
         }
     }
 
-    pub fn view(&self) -> Mat4 { self.view }
-    pub fn proj(&self) -> Mat4 { self.proj }
+    pub fn view(&self)      -> Mat4 { self.view }
+    pub fn proj(&self)      -> Mat4 { self.proj }
     pub fn view_proj(&self) -> Mat4 { self.view_proj }
 }
 
-/// Simple FPS-style orbit camera controller.
+#[derive(PartialEq)]
+enum DragMode { None, Orbit, Pan }
+
+/// Orbital camera — Blender/Maya style:
+///   LMB drag     → orbit around target
+///   MMB drag     → pan
+///   Scroll       → dolly zoom
+///   Numpad 1/3/7 → front/right/top view
+///   F            → reset to origin
 pub struct CameraController {
-    speed: f32,
-    sensitivity: f32,
-    yaw: f32,   // radians
-    pitch: f32, // radians
-    forward: bool,
-    backward: bool,
-    left: bool,
-    right: bool,
-    up: bool,
-    down: bool,
-    delta_x: f64,
-    delta_y: f64,
+    pub radius: f32,
+    pub yaw:    f32,
+    pub pitch:  f32,
+    drag_mode:    DragMode,
+    last_x:       f64,
+    last_y:       f64,
+    pending_dx:   f64,
+    pending_dy:   f64,
+    pending_zoom: f32,
+    orbit_speed:  f32,
+    pan_speed:    f32,
+    zoom_speed:   f32,
 }
 
 impl CameraController {
-    pub fn new(speed: f32, sensitivity: f32) -> Self {
+    pub fn new(distance: f32, yaw: f32, pitch: f32) -> Self {
         Self {
-            speed,
-            sensitivity,
-            yaw: -std::f32::consts::FRAC_PI_2,
-            pitch: -0.3,
-            forward: false,
-            backward: false,
-            left: false,
-            right: false,
-            up: false,
-            down: false,
-            delta_x: 0.0,
-            delta_y: 0.0,
+            radius: distance, yaw, pitch,
+            drag_mode: DragMode::None,
+            last_x: 0.0, last_y: 0.0,
+            pending_dx: 0.0, pending_dy: 0.0, pending_zoom: 0.0,
+            orbit_speed: 0.005, pan_speed: 0.001, zoom_speed: 0.15,
         }
     }
 
-    pub fn process_keyboard(&mut self, event: &KeyEvent) {
-        let pressed = event.state == ElementState::Pressed;
+    pub fn process_mouse_button(&mut self, button: &MouseButton, state: &ElementState) {
+        let pressed = *state == ElementState::Pressed;
+        match button {
+            MouseButton::Left => {
+                if pressed { self.drag_mode = DragMode::Orbit; }
+                else if self.drag_mode == DragMode::Orbit { self.drag_mode = DragMode::None; }
+            }
+            MouseButton::Middle => {
+                if pressed { self.drag_mode = DragMode::Pan; }
+                else if self.drag_mode == DragMode::Pan { self.drag_mode = DragMode::None; }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn process_cursor_moved(&mut self, x: f64, y: f64) {
+        let dx = x - self.last_x;
+        let dy = y - self.last_y;
+        self.last_x = x;
+        self.last_y = y;
+        match self.drag_mode {
+            DragMode::Orbit | DragMode::Pan => {
+                self.pending_dx += dx;
+                self.pending_dy += dy;
+            }
+            DragMode::None => {}
+        }
+    }
+
+    pub fn process_scroll(&mut self, delta: &MouseScrollDelta) {
+        self.pending_zoom += match delta {
+            MouseScrollDelta::LineDelta(_, y)  => *y,
+            MouseScrollDelta::PixelDelta(pos)  => pos.y as f32 * 0.05,
+        };
+    }
+
+    pub fn process_keyboard(&mut self, event: &KeyEvent, camera: &mut Camera) {
+        if event.state != ElementState::Pressed { return; }
         if let PhysicalKey::Code(code) = event.physical_key {
             match code {
-                KeyCode::KeyW | KeyCode::ArrowUp => self.forward = pressed,
-                KeyCode::KeyS | KeyCode::ArrowDown => self.backward = pressed,
-                KeyCode::KeyA | KeyCode::ArrowLeft => self.left = pressed,
-                KeyCode::KeyD | KeyCode::ArrowRight => self.right = pressed,
-                KeyCode::KeyE | KeyCode::Space => self.up = pressed,
-                KeyCode::KeyQ => self.down = pressed,
+                KeyCode::Numpad1 => { self.yaw = 0.0;                         self.pitch = 0.0; camera.dirty = true; }
+                KeyCode::Numpad3 => { self.yaw = std::f32::consts::FRAC_PI_2; self.pitch = 0.0; camera.dirty = true; }
+                KeyCode::Numpad7 => { self.pitch = std::f32::consts::FRAC_PI_2 - 0.01; camera.dirty = true; }
+                KeyCode::Numpad9 => { self.pitch = -(std::f32::consts::FRAC_PI_2 - 0.01); camera.dirty = true; }
+                KeyCode::KeyF    => { camera.target = Vec3::ZERO; self.radius = 5.0; camera.dirty = true; }
+                KeyCode::NumpadAdd      => { self.pending_zoom += 2.0; }
+                KeyCode::NumpadSubtract => { self.pending_zoom -= 2.0; }
                 _ => {}
             }
         }
     }
 
-    pub fn process_mouse(&mut self, dx: f64, dy: f64) {
-        self.delta_x += dx;
-        self.delta_y += dy;
-    }
-
     pub fn update_camera(&mut self, camera: &mut Camera) {
-        let dt = 1.0 / 60.0_f32; // fixed step; replace with actual delta
+        let dx = self.pending_dx as f32;
+        let dy = self.pending_dy as f32;
 
-        // Apply mouse look
-        self.yaw += self.delta_x as f32 * self.sensitivity * dt;
-        self.pitch -= self.delta_y as f32 * self.sensitivity * dt;
-        self.pitch = self.pitch.clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
-        self.delta_x = 0.0;
-        self.delta_y = 0.0;
-
-        // Compute forward/right/up vectors from yaw+pitch
-        let forward = Vec3::new(
-            self.yaw.cos() * self.pitch.cos(),
-            self.pitch.sin(),
-            self.yaw.sin() * self.pitch.cos(),
-        )
-        .normalize();
-        let right = forward.cross(Vec3::Y).normalize();
-
-        // Move camera
-        let mut velocity = Vec3::ZERO;
-        if self.forward  { velocity += forward; }
-        if self.backward { velocity -= forward; }
-        if self.right    { velocity += right; }
-        if self.left     { velocity -= right; }
-        if self.up       { velocity += Vec3::Y; }
-        if self.down     { velocity -= Vec3::Y; }
-
-        if velocity.length_squared() > 0.0 {
-            camera.position += velocity.normalize() * self.speed * dt;
-            camera.dirty = true;
+        match self.drag_mode {
+            DragMode::Orbit => {
+                self.yaw   += dx * self.orbit_speed;
+                self.pitch += dy * self.orbit_speed;
+                self.pitch  = self.pitch.clamp(
+                    -(std::f32::consts::FRAC_PI_2 - 0.02),
+                     std::f32::consts::FRAC_PI_2 - 0.02,
+                );
+                camera.dirty = true;
+            }
+            DragMode::Pan => {
+                let forward   = (camera.target - camera.position).normalize();
+                let right     = forward.cross(Vec3::Y).normalize();
+                let up        = right.cross(forward).normalize();
+                let pan_scale = self.radius * self.pan_speed;
+                camera.target -= right * dx * pan_scale;
+                camera.target += up    * dy * pan_scale;
+                camera.dirty   = true;
+            }
+            DragMode::None => {}
         }
 
-        // Always update target from yaw/pitch
-        camera.target = camera.position + forward;
-        camera.dirty = true;
+        if self.pending_zoom.abs() > 0.001 {
+            self.radius  *= (1.0 - self.pending_zoom * self.zoom_speed).max(0.01);
+            self.radius   = self.radius.clamp(0.05, 500.0);
+            camera.dirty  = true;
+        }
 
-        camera.rebuild_if_dirty();
+        self.pending_dx   = 0.0;
+        self.pending_dy   = 0.0;
+        self.pending_zoom = 0.0;
+
+        if camera.dirty {
+            let (sp, cp) = (self.pitch.sin(), self.pitch.cos());
+            let (sy, cy) = (self.yaw.sin(),   self.yaw.cos());
+            camera.position = camera.target + Vec3::new(cp * cy, sp, cp * sy) * self.radius;
+            camera.rebuild_if_dirty();
+        }
     }
 }
