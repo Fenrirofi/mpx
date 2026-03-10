@@ -8,7 +8,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
-pub const KERNEL_SIZE: usize = 64;
+pub const KERNEL_SIZE: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -153,9 +153,9 @@ impl SsaoRenderer {
             proj:         Mat4::IDENTITY.to_cols_array_2d(),
             inv_proj:     Mat4::IDENTITY.to_cols_array_2d(),
             view:         Mat4::IDENTITY.to_cols_array_2d(),
-            radius:       0.5,
+            radius:       0.3,
             bias:         0.025,
-            strength:     1.5,
+            strength:     0.8,
             sample_count: KERNEL_SIZE as u32,
             noise_scale:  [width as f32 / 4.0, height as f32 / 4.0],
             _pad:         [0.0; 2],

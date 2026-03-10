@@ -90,7 +90,9 @@ impl Mesh {
                 let normal = Vec3::new(x, y, z);
                 let tangent = Vec4::new(-theta.sin(), 0.0, theta.cos(), 1.0);
                 let uv = Vec2::new(slice as f32 / slices as f32, stack as f32 / stacks as f32);
-                vertices.push(Vertex::new(normal, normal, tangent, uv));
+                let position = Vec3::new(x, y, z); // ← osobna zmienna
+                let normal   = Vec3::new(x, y, z); // ta sama wartość, ale semantycznie oddzielna
+                vertices.push(Vertex::new(position, normal, tangent, uv));
             }
         }
 
@@ -98,7 +100,7 @@ impl Mesh {
             for slice in 0..slices {
                 let first = stack * (slices + 1) + slice;
                 let second = first + slices + 1;
-                indices.extend_from_slice(&[first, second, first + 1, second, second + 1, first + 1]);
+                indices.extend_from_slice(&[first, first + 1, second, second, first + 1, second + 1]);
             }
         }
 

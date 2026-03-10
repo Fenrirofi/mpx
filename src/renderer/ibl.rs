@@ -191,12 +191,12 @@ pub fn bake_ibl(
 
     let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("ibl_linear"),
-        mag_filter:    wgpu::FilterMode::Linear,
-        min_filter:    wgpu::FilterMode::Linear,
-        mipmap_filter: wgpu::MipmapFilterMode::Linear,
-        address_mode_u: wgpu::AddressMode::Repeat,
-        address_mode_v: wgpu::AddressMode::Repeat,
-        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter:     wgpu::FilterMode::Linear,
+        min_filter:     wgpu::FilterMode::Linear,
+        mipmap_filter:  wgpu::MipmapFilterMode::Linear,
+        address_mode_u: wgpu::AddressMode::ClampToEdge,  // było Repeat
+        address_mode_v: wgpu::AddressMode::ClampToEdge,  // było Repeat
+        address_mode_w: wgpu::AddressMode::ClampToEdge,  // było Repeat
         ..Default::default()
     });
 

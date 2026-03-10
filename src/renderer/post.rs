@@ -22,15 +22,15 @@ pub struct PostParams {
 impl Default for PostParams {
     fn default() -> Self {
         Self {
-            bloom_strength:      0.0,
+            bloom_strength:      0.015,
             exposure:            0.0,
-            ca_strength:         0.4,
+            ca_strength:         0.04,
             vignette_strength:   0.45,
             vignette_radius:     0.75,
             vignette_smoothness: 0.4,
             grain_strength:      0.02,
             time:                0.0,
-            ssao_strength:       0.7,
+            ssao_strength:       0.0,
             _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
         }
     }

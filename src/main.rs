@@ -50,7 +50,7 @@ impl ApplicationHandler for App {
             .expect("renderer");
 
         if let Err(e) = render_ctx.load_hdr("assets/ticknock_01_4k.hdr") {
-            log::warn!("HDR not loaded: {e}");
+            log::warn!("HDR not loaded: {e}");  // cicho pomija błąd!
         }
 
         let scene      = Scene::default_scene();

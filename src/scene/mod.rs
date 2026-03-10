@@ -70,7 +70,7 @@ impl Scene {
             // Cool sky fill
             Light::point(vec3(-6.0, 5.0, 3.0), Vec3::new(0.3, 0.5, 1.0), 80.0),
             // Warm rim
-            Light::point(vec3(4.0, 3.0, -5.0), Vec3::new(1.0, 0.7, 0.4), 60.0),
+            Light::point(vec3(4.0, 3.0, -5.0), Vec3::new(1.0, 0.7, 0.4), 30.0),
         ];
 
         Self {

@@ -18,7 +18,7 @@ impl ShadowUniform {
     pub fn new(light_view_proj: Mat4, enabled: bool) -> Self {
         Self {
             light_view_proj: light_view_proj.to_cols_array_2d(),
-            shadow_params: [0.0005, 0.002, 2.0, if enabled { 1.0 } else { 0.0 }],
+            shadow_params: [0.001, 0.003, 1.5, if enabled { 1.0 } else { 0.0 }],
         }
     }
 }
