@@ -1,18 +1,18 @@
-mod renderer;
-mod scene;
 mod assets;
 mod math;
+mod renderer;
+mod scene;
 mod utils;
 
 use anyhow::Result;
 use log::info;
+use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
-use std::sync::Arc;
 
 use renderer::RenderContext;
 use scene::Scene;
@@ -49,10 +49,12 @@ impl ApplicationHandler for App {
                 .expect("Failed to create window"),
         );
 
-        let render_ctx = pollster::block_on(RenderContext::new(Arc::clone(&window)))
+        let mut render_ctx = pollster::block_on(RenderContext::new(Arc::clone(&window)))
             .expect("Failed to initialize renderer");
 
         let scene = Scene::default_scene();
+
+        render_ctx.load_hdr("assets/ticknock_01_4k.hdr").unwrap();
 
         self.state = Some(AppState {
             window,
@@ -115,7 +117,10 @@ impl ApplicationHandler for App {
         let Some(state) = &mut self.state else { return };
 
         if let DeviceEvent::MouseMotion { delta } = event {
-            state.scene.camera_controller.process_mouse(delta.0, delta.1);
+            state
+                .scene
+                .camera_controller
+                .process_mouse(delta.0, delta.1);
         }
     }
 }

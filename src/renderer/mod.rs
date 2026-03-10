@@ -6,5 +6,7 @@ pub mod texture;
 pub mod skybox;
 pub mod shadow;
 pub mod post;
+pub mod ibl;
+pub mod ssao;
 
 pub use context::RenderContext;

@@ -98,16 +98,21 @@ fn fs_bloom_blur(in: PostVOut) -> @location(0) vec4<f32> {
 @group(0) @binding(2) var s_comp:     sampler;
 
 struct PostParams {
-    bloom_strength:       f32,
-    exposure:             f32,   // EV stops
-    ca_strength:          f32,   // chromatic aberration magnitude
-    vignette_strength:    f32,
-    vignette_radius:      f32,
-    vignette_smoothness:  f32,
-    grain_strength:       f32,
-    time:                 f32,   // for animated grain
+    bloom_strength:      f32,
+    exposure:            f32,
+    ca_strength:         f32,
+    vignette_strength:   f32,
+    vignette_radius:     f32,
+    vignette_smoothness: f32,
+    grain_strength:      f32,
+    time:                f32,
+    ssao_strength:       f32,
+    _pad0:               f32,
+    _pad1:               f32,
+    _pad2:               f32,
 }
-@group(0) @binding(3) var<uniform> post: PostParams;
+@group(0) @binding(3) var<uniform> post:  PostParams;
+@group(0) @binding(4) var t_ssao:         texture_2d<f32>;
 
 // ── ACES fitted (Hill/Narkowicz) ──────────────────────────────────────────────
 fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
@@ -145,6 +150,11 @@ fn fs_composite(in: PostVOut) -> @location(0) vec4<f32> {
 
     // HDR color with chromatic aberration
     var hdr = chromatic_aberration(in.uv, post.ca_strength * 0.005);
+
+    // SSAO — multiply ambient before bloom/tonemap for physically correct darkening
+    let ao    = textureSample(t_ssao, s_comp, in.uv).r;
+    let ao_f  = mix(1.0, ao, post.ssao_strength);
+    hdr      *= ao_f;
 
     // Add bloom
     let bloom_color = textureSample(t_bloom_in, s_comp, in.uv).rgb;

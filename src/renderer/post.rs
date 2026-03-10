@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 
 /// Parameters sent to the composite shader.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PostParams {
     pub bloom_strength:      f32,
     pub exposure:            f32,
@@ -13,6 +13,10 @@ pub struct PostParams {
     pub vignette_smoothness: f32,
     pub grain_strength:      f32,
     pub time:                f32,
+    pub ssao_strength:       f32,
+    pub _pad0:               f32,
+    pub _pad1:               f32,
+    pub _pad2:               f32,
 }
 
 impl Default for PostParams {
@@ -26,6 +30,10 @@ impl Default for PostParams {
             vignette_smoothness: 0.4,
             grain_strength:      0.5,
             time:                0.0,
+            ssao_strength: 1.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
         }
     }
 }
@@ -223,6 +231,10 @@ impl PostProcessor {
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+
             ],
         });
 
@@ -286,9 +298,10 @@ impl PostProcessor {
     /// Run the full post stack: threshold → blur×N → composite → swapchain.
     pub fn render(
         &self,
-        device:    &wgpu::Device,
-        encoder:   &mut wgpu::CommandEncoder,
+        device:      &wgpu::Device,
+        encoder:     &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
+        ssao_view:   &wgpu::TextureView,
     ) {
         // ── Pass 1: bloom threshold (HDR → bloom_a) ───────────────────────────
         let thresh_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -327,6 +340,7 @@ impl PostProcessor {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.bloom_a_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.linear_sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: self.post_params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ssao_view) }, // ← nowe
             ],
         });
         self.run_pass(encoder, &self.composite_pipeline, &comp_bg, output_view);
