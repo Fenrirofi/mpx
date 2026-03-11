@@ -30,15 +30,13 @@ fn lerp(a: f32, b: f32, t: f32) -> f32 { a + t * (b - a) }
 pub fn generate_ssao_kernel() -> Vec<[f32; 4]> {
     let mut kernel = Vec::with_capacity(KERNEL_SIZE);
     for i in 0..KERNEL_SIZE {
-        // Pseudo-random hemisphere sample
         let scale = i as f32 / KERNEL_SIZE as f32;
         let scale = lerp(0.1, 1.0, scale * scale);
-        // Use a simple hash to avoid rand dependency
         let fi    = i as f32;
         let x     = (fi * 1.618033988 % 1.0) * 2.0 - 1.0;
         let y     = (fi * 0.381966011 % 1.0) * 2.0 - 1.0;
-        let z     = (fi * 0.618033988 % 1.0);
-        let v     = Vec3::new(x, y, z.max(0.1)).normalize() * scale;
+        let z     = (fi * 0.618033988 % 1.0) * 0.9 + 0.1; // z ∈ [0.1, 1.0) — nigdy 0
+        let v     = Vec3::new(x, y, z).normalize() * scale;
         kernel.push([v.x, v.y, v.z, 0.0]);
     }
     kernel
@@ -312,16 +310,19 @@ impl SsaoRenderer {
         let wx = (self.width  + 7) / 8;
         let wy = (self.height + 7) / 8;
 
+        // SSAO pass
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ssao"), timestamp_writes: None });
         pass.set_pipeline(&self.ssao_pipeline);
         pass.set_bind_group(0, &ssao_bg, &[]);
         pass.dispatch_workgroups(wx, wy, 1);
         drop(pass);
-
+        
+        // Blur pass
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ssao_blur"), timestamp_writes: None });
         pass.set_pipeline(&self.blur_pipeline);
         pass.set_bind_group(0, &blur_bg, &[]);
         pass.dispatch_workgroups(wx, wy, 1);
+        drop(pass);
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32) {

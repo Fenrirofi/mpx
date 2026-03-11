@@ -74,7 +74,8 @@ fn cs_ssao(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sample = pos + s;
 
         let offset = ssao_params.proj * vec4<f32>(sample, 1.0);
-        let suv    = offset.xy / offset.w * 0.5 + 0.5;
+        let suv = vec2<f32>(offset.x / offset.w * 0.5 + 0.5,
+                            offset.y / offset.w * -0.5 + 0.5);
         if any(suv < vec2<f32>(0.0)) || any(suv > vec2<f32>(1.0)) { continue; }
 
         let sd  = load_depth_uv(suv, fdims);

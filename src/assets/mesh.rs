@@ -87,12 +87,11 @@ impl Mesh {
                 let x = sin_phi * theta.cos();
                 let y = phi.cos();
                 let z = sin_phi * theta.sin();
-                let normal = Vec3::new(x, y, z);
+                let position = Vec3::new(x, y, z);  // ← dodaj tę linię
+                let normal = Vec3::new(x, y, z);    // normalised = pozycja na unit sphere (bez zmian)
                 let tangent = Vec4::new(-theta.sin(), 0.0, theta.cos(), 1.0);
                 let uv = Vec2::new(slice as f32 / slices as f32, stack as f32 / stacks as f32);
-                let position = Vec3::new(x, y, z); // ← osobna zmienna
-                let normal   = Vec3::new(x, y, z); // ta sama wartość, ale semantycznie oddzielna
-                vertices.push(Vertex::new(position, normal, tangent, uv));
+                vertices.push(Vertex::new(normal, normal, tangent, uv));
             }
         }
 

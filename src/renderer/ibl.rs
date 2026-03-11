@@ -11,7 +11,7 @@ use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
-const ENV_SIZE:     u32 = 512;
+const ENV_SIZE:     u32 = 256;
 const IRRAD_SIZE:   u32 = 32;
 const PREFILTER_SIZE: u32 = 128;
 const PREFILTER_MIPS: u32 = 5;
@@ -197,6 +197,8 @@ pub fn bake_ibl(
         address_mode_u: wgpu::AddressMode::ClampToEdge,  // było Repeat
         address_mode_v: wgpu::AddressMode::ClampToEdge,  // było Repeat
         address_mode_w: wgpu::AddressMode::ClampToEdge,  // było Repeat
+        lod_min_clamp: 0.0,
+        lod_max_clamp: 4.0,
         ..Default::default()
     });
 
@@ -410,9 +412,9 @@ pub fn bake_ibl(
         array_layer_count: Some(6), ..Default::default()
     });
     let prefilter_view = pre_tex.create_view(&wgpu::TextureViewDescriptor {
-        dimension: Some(wgpu::TextureViewDimension::Cube),
+        dimension:         Some(wgpu::TextureViewDimension::Cube),
         array_layer_count: Some(6),
-        mip_level_count: Some(PREFILTER_MIPS),
+        mip_level_count:   Some(PREFILTER_MIPS),  // ← musi być wszystkie mipy, nie 1
         ..Default::default()
     });
 
