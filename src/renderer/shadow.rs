@@ -1,50 +1,59 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║  Cascaded Shadow Maps (CSM)                                                 ║
+// ║  4 kaskady, każda 2048×2048 Depth32Float                                   ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+
 use bytemuck::{Pod, Zeroable};
-use glam::Mat4;
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 
-pub const SHADOW_MAP_SIZE: u32 = 2048;
+pub const NUM_CASCADES:    usize = 4;
+pub const SHADOW_MAP_SIZE: u32   = 2048;
 pub const SHADOW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// GPU uniform for shadow pass
+const CASCADE_LAMBDA: f32 = 0.75;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub struct ShadowUniform {
-    pub light_view_proj: [[f32; 4]; 4],
-    /// x=bias, y=normal_bias, z=pcf_radius, w=enabled
-    pub shadow_params: [f32; 4],
+pub struct CsmUniform {
+    pub light_view_proj: [[[f32; 4]; 4]; 4],
+    pub cascade_index:   u32,
+    pub _pad:            [u32; 3],
 }
 
-impl ShadowUniform {
-    pub fn new(light_view_proj: Mat4, enabled: bool) -> Self {
-        // z = texel_size = 1.0 / shadow_map_resolution — używane przez PCF w shaderze
-        let texel_size = 1.0 / SHADOW_MAP_SIZE as f32;
-        Self {
-            light_view_proj: light_view_proj.to_cols_array_2d(),
-            shadow_params: [0.001, 0.003, texel_size, if enabled { 1.0 } else { 0.0 }],
-        }
-    }
+/// Dane wysyłane do PBR shadera (group 3 binding 1)
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct CsmPbrUniform {
+    pub light_view_proj: [[[f32; 4]; 4]; 4],
+    /// Granice kaskad w view-space Z
+    pub cascade_splits:  [f32; 4],
+    /// x=min_bias, y=slope_bias, z=texel_size, w=unused
+    pub shadow_params:   [f32; 4],
 }
 
-pub struct ShadowRenderer {
-    pub shadow_texture: wgpu::Texture,
-    pub shadow_view:    wgpu::TextureView,
-    pub sampler:        wgpu::Sampler,
-    pub pipeline:       wgpu::RenderPipeline,
-    pub uniform_buf:    wgpu::Buffer,
-    pub uniform_bgl:    wgpu::BindGroupLayout,
-    pub uniform_bg:     wgpu::BindGroup,
-    pub object_bgl:     wgpu::BindGroupLayout,
+pub struct CsmRenderer {
+    pub shadow_texture:    wgpu::Texture,
+    pub shadow_array_view: wgpu::TextureView,
+    cascade_views:         [wgpu::TextureView; NUM_CASCADES],
+    pub sampler:           wgpu::Sampler,
+    pub pipeline:          wgpu::RenderPipeline,
+    pub csm_uniform_buf:   wgpu::Buffer,
+    pub csm_uniform_bgl:   wgpu::BindGroupLayout,
+    pub csm_uniform_bg:    wgpu::BindGroup,
+    pub pbr_uniform_buf:   wgpu::Buffer,
+    pub object_bgl:        wgpu::BindGroupLayout,
+    pub last_pbr_uniform:  CsmPbrUniform,
 }
 
-impl ShadowRenderer {
+impl CsmRenderer {
     pub fn new(device: &wgpu::Device) -> Self {
-        // ── Shadow map texture ────────────────────────────────────────────────
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label:           Some("shadow_map"),
-            size:            wgpu::Extent3d {
-                width:                SHADOW_MAP_SIZE,
-                height:               SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
+            label: Some("csm_shadow_array"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: NUM_CASCADES as u32,
             },
             mip_level_count: 1,
             sample_count:    1,
@@ -52,16 +61,30 @@ impl ShadowRenderer {
             format:          SHADOW_DEPTH_FORMAT,
             usage:           wgpu::TextureUsages::RENDER_ATTACHMENT
                            | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats:    &[],
+            view_formats: &[],
         });
 
-        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::DepthOnly,
+        let shadow_array_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+            label:             Some("csm_array_view"),
+            dimension:         Some(wgpu::TextureViewDimension::D2Array),
+            aspect:            wgpu::TextureAspect::DepthOnly,
+            array_layer_count: Some(NUM_CASCADES as u32),
             ..Default::default()
         });
 
+        let cascade_views = std::array::from_fn(|i| {
+            shadow_texture.create_view(&wgpu::TextureViewDescriptor {
+                label:             Some(&format!("csm_cascade_{i}")),
+                dimension:         Some(wgpu::TextureViewDimension::D2),
+                aspect:            wgpu::TextureAspect::DepthOnly,
+                base_array_layer:  i as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label:          Some("shadow_sampler"),
+            label:          Some("csm_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -72,14 +95,13 @@ impl ShadowRenderer {
             ..Default::default()
         });
 
-        // ── Bind group layouts ────────────────────────────────────────────────
-        let uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadow_uniform_bgl"),
+        let csm_uniform_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("csm_uniform_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding:    0,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
-                    ty:                 wgpu::BufferBindingType::Uniform,
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size:   None,
                 },
@@ -88,12 +110,12 @@ impl ShadowRenderer {
         });
 
         let object_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("shadow_object_bgl"),
+            label: Some("csm_object_bgl"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding:    0,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
-                    ty:                 wgpu::BufferBindingType::Uniform,
+                    ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size:   None,
                 },
@@ -101,56 +123,65 @@ impl ShadowRenderer {
             }],
         });
 
-        // ── Uniform buffer ────────────────────────────────────────────────────
-        let identity = ShadowUniform::new(Mat4::IDENTITY, false);
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("shadow_uniform_buf"),
-            contents: bytemuck::bytes_of(&identity),
+        let zero_csm = CsmUniform {
+            light_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); 4],
+            cascade_index: 0,
+            _pad: [0; 3],
+        };
+        let csm_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("csm_uniform_buf"),
+            contents: bytemuck::bytes_of(&zero_csm),
             usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("shadow_uniform_bg"),
-            layout:  &uniform_bgl,
+        let zero_pbr = CsmPbrUniform {
+            light_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); 4],
+            cascade_splits:  [10.0, 50.0, 150.0, 500.0],
+            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 0.0],
+        };
+        let pbr_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("csm_pbr_uniform_buf"),
+            contents: bytemuck::bytes_of(&zero_pbr),
+            usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let csm_uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("csm_uniform_bg"),
+            layout:  &csm_uniform_bgl,
             entries: &[wgpu::BindGroupEntry {
                 binding:  0,
-                resource: uniform_buf.as_entire_binding(),
+                resource: csm_uniform_buf.as_entire_binding(),
             }],
         });
 
-        // ── Pipeline ──────────────────────────────────────────────────────────
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label:  Some("shadow_shader"),
+            label:  Some("csm_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shadow.wgsl").into()),
         });
-
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label:              Some("shadow_pipeline_layout"),
-            bind_group_layouts: &[&uniform_bgl, &object_bgl],
+            label:              Some("csm_pipeline_layout"),
+            bind_group_layouts: &[&csm_uniform_bgl, &object_bgl],
             immediate_size:     0,
         });
-
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label:  Some("shadow_pipeline"),
+            label:  Some("csm_pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module:      &shader,
                 entry_point: Some("vs_shadow"),
-                // Only position needed
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<crate::assets::Vertex>() as u64,
                     step_mode:    wgpu::VertexStepMode::Vertex,
                     attributes:   &[wgpu::VertexAttribute {
-                        offset:           0,
-                        shader_location:  0,
-                        format:           wgpu::VertexFormat::Float32x3,
+                        offset: 0, shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x3,
                     }],
                 }],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
-                topology:           wgpu::PrimitiveTopology::TriangleList,
-                cull_mode:          Some(wgpu::Face::Front), // Peter-panning fix
+                topology:  wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: Some(wgpu::Face::Front),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -158,45 +189,112 @@ impl ShadowRenderer {
                 depth_write_enabled: true,
                 depth_compare:       wgpu::CompareFunction::Less,
                 stencil:             Default::default(),
-                bias: wgpu::DepthBiasState {
-                    constant: 2,
-                    slope_scale: 2.0,
-                    clamp: 0.0,
-                },
+                bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
             }),
             multisample: wgpu::MultisampleState::default(),
-            fragment: None,
+            fragment:    None,
             multiview_mask: None,
             cache: None,
         });
 
         Self {
-            shadow_texture,
-            shadow_view,
-            sampler,
-            pipeline,
-            uniform_buf,
-            uniform_bgl,
-            uniform_bg,
-            object_bgl,
+            shadow_texture, shadow_array_view, cascade_views, sampler,
+            pipeline, csm_uniform_buf, csm_uniform_bgl, csm_uniform_bg,
+            pbr_uniform_buf, object_bgl, last_pbr_uniform: zero_pbr,
         }
     }
 
-    /// Compute orthographic light-space matrix for a directional light.
-    pub fn compute_light_matrix(light_dir: glam::Vec3, scene_center: glam::Vec3, scene_radius: f32) -> Mat4 {
-        let light_pos = scene_center - light_dir * scene_radius * 2.0;
-        let view = Mat4::look_at_rh(light_pos, scene_center, glam::Vec3::Y);
-        let proj = Mat4::orthographic_rh(
-            -scene_radius, scene_radius,
-            -scene_radius, scene_radius,
-            0.1, scene_radius * 4.0,
-        );
-        proj * view
+    /// Lambda-blended cascade splits (Engel 2007)
+    pub fn compute_cascade_splits(near: f32, far: f32) -> [f32; NUM_CASCADES] {
+        let range = far - near;
+        let ratio = far / near;
+        std::array::from_fn(|i| {
+            let p       = (i + 1) as f32 / NUM_CASCADES as f32;
+            let log     = near * ratio.powf(p);
+            let uniform = near + range * p;
+            CASCADE_LAMBDA * (log - uniform) + uniform - near
+        })
     }
 
-    /// Update the shadow uniform with the current light matrix.
-    pub fn update(&self, queue: &wgpu::Queue, light_view_proj: Mat4) {
-        let uniform = ShadowUniform::new(light_view_proj, true);
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniform));
+    /// Oblicz macierze ortograficzne okalające każdą kaskadę frustum kamery.
+    pub fn compute_cascade_matrices(
+        light_dir: Vec3,
+        cam_view:  Mat4,
+        cam_proj:  Mat4,
+        near:      f32,
+        splits:    &[f32; NUM_CASCADES],
+    ) -> [Mat4; NUM_CASCADES] {
+        let inv_vp = (cam_proj * cam_view).inverse();
+        let up = if light_dir.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+        let light_view = Mat4::look_at_rh(Vec3::ZERO, light_dir, up);
+
+        let mut slice_near = near;
+        std::array::from_fn(|i| {
+            let slice_far = slice_near + splits[i];
+            let corners   = frustum_slice_world(inv_vp, slice_near, slice_far, cam_proj);
+            slice_near    = slice_far;
+
+            let ls: Vec<Vec3> = corners.iter()
+                .map(|c| (light_view * Vec4::from((*c, 1.0))).truncate())
+                .collect();
+
+            let mn = ls.iter().fold(Vec3::splat(f32::MAX), |a, b| a.min(*b));
+            let mx = ls.iter().fold(Vec3::splat(f32::MIN), |a, b| a.max(*b));
+            let z_slack = (mx.z - mn.z) * 0.2;
+
+            let proj = Mat4::orthographic_rh(mn.x, mx.x, mn.y, mx.y,
+                                             mn.z - z_slack, mx.z + z_slack);
+            proj * light_view
+        })
     }
+
+    pub fn update(&mut self, queue: &wgpu::Queue,
+                  matrices: &[Mat4; NUM_CASCADES], splits: &[f32; NUM_CASCADES]) {
+        let pbr = CsmPbrUniform {
+            light_view_proj: std::array::from_fn(|i| matrices[i].to_cols_array_2d()),
+            cascade_splits:  *splits,
+            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 0.0],
+        };
+        queue.write_buffer(&self.pbr_uniform_buf, 0, bytemuck::bytes_of(&pbr));
+        self.last_pbr_uniform = pbr;
+
+        let csm_u = CsmUniform {
+            light_view_proj: std::array::from_fn(|i| matrices[i].to_cols_array_2d()),
+            cascade_index: 0,
+            _pad: [0; 3],
+        };
+        queue.write_buffer(&self.csm_uniform_buf, 0, bytemuck::bytes_of(&csm_u));
+    }
+
+    pub fn set_cascade(&self, queue: &wgpu::Queue, index: usize) -> &wgpu::TextureView {
+        let offset = std::mem::size_of::<[[[f32; 4]; 4]; 4]>() as u64;
+        let idx = index as u32;
+        queue.write_buffer(&self.csm_uniform_buf, offset, bytemuck::bytes_of(&idx));
+        &self.cascade_views[index]
+    }
+}
+
+fn frustum_slice_world(inv_vp: Mat4, near: f32, far: f32, proj: Mat4) -> [Vec3; 8] {
+    // Wyciągnij near/far z macierzy proj żeby znormalizować do NDC Z
+    let proj_near = -proj.w_axis.z / proj.z_axis.z;
+    let proj_far  = proj.w_axis.z / (1.0 - proj.z_axis.z);
+    let total_range = proj_far - proj_near;
+
+    let ndc_near = if total_range.abs() > 0.0001 {
+        (near - proj_near) / total_range
+    } else { 0.0 };
+    let ndc_far = if total_range.abs() > 0.0001 {
+        (far  - proj_near) / total_range
+    } else { 1.0 };
+
+    let ndc_pts = [
+        Vec4::new(-1.0, -1.0, ndc_near, 1.0), Vec4::new(1.0, -1.0, ndc_near, 1.0),
+        Vec4::new(-1.0,  1.0, ndc_near, 1.0), Vec4::new(1.0,  1.0, ndc_near, 1.0),
+        Vec4::new(-1.0, -1.0, ndc_far,  1.0), Vec4::new(1.0, -1.0, ndc_far,  1.0),
+        Vec4::new(-1.0,  1.0, ndc_far,  1.0), Vec4::new(1.0,  1.0, ndc_far,  1.0),
+    ];
+    std::array::from_fn(|i| {
+        let w = inv_vp * ndc_pts[i];
+        w.truncate() / w.w
+    })
 }

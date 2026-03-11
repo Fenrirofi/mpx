@@ -100,11 +100,11 @@ pub fn lights_shadow_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroup
                     has_dynamic_offset: false, min_binding_size: None },
                 count: None,
             },
-            // 2: shadow depth map
+            // 2: CSM shadow depth array (4 kaskady)
             wgpu::BindGroupLayoutEntry {
                 binding: 2, visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
                 count: None,
             },
             // 3: shadow comparison sampler

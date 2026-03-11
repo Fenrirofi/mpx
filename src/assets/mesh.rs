@@ -48,12 +48,7 @@ impl Vertex {
         }
     }
 
-    pub fn new(
-        position: Vec3,
-        normal: Vec3,
-        tangent: Vec4,
-        uv: Vec2,
-    ) -> Self {
+    pub fn new(position: Vec3, normal: Vec3, tangent: Vec4, uv: Vec2) -> Self {
         Self {
             position: position.to_array(),
             normal: normal.to_array(),
@@ -73,6 +68,7 @@ pub struct Mesh {
 
 impl Mesh {
     /// Build a simple UV sphere with mikktspace-style tangents placeholder.
+
     pub fn uv_sphere(stacks: u32, slices: u32) -> Self {
         use std::f32::consts::PI;
 
@@ -80,18 +76,41 @@ impl Mesh {
         let mut indices = Vec::new();
 
         for stack in 0..=stacks {
-            let phi = PI * stack as f32 / stacks as f32;
+            // Dodajemy mały epsilon do phi, aby uniknąć sin(0) = 0 na biegunach.
+            // To sprawia, że tan_raw nigdy nie będzie wektorem zerowym.
+            let phi = PI * (stack as f32 / stacks as f32);
+
             for slice in 0..=slices {
-                let theta = 2.0 * PI * slice as f32 / slices as f32;
+                let theta = 2.0 * PI * (slice as f32 / slices as f32);
+
                 let sin_phi = phi.sin();
-                let x = sin_phi * theta.cos();
-                let y = phi.cos();
-                let z = sin_phi * theta.sin();
-                let position = Vec3::new(x, y, z);  // ← dodaj tę linię
-                let normal = Vec3::new(x, y, z);    // normalised = pozycja na unit sphere (bez zmian)
-                let tangent = Vec4::new(-theta.sin(), 0.0, theta.cos(), 1.0);
+                let cos_phi = phi.cos();
+                let sin_theta = theta.sin();
+                let cos_theta = theta.cos();
+
+                let x = sin_phi * cos_theta;
+                let y = cos_phi;
+                let z = sin_phi * sin_theta;
+
+                let position = Vec3::new(x, y, z);
+                let normal = position; // Na sferze jednostkowej normalna = pozycja
                 let uv = Vec2::new(slice as f32 / slices as f32, stack as f32 / stacks as f32);
-                vertices.push(Vertex::new(normal, normal, tangent, uv));
+
+                // Obliczanie tangentu (pochodna pozycji względem theta)
+                // Dzięki sin_phi, na biegunach ten wektor stawałby się [0,0,0]
+                let mut tangent_xyz = Vec3::new(-sin_theta, 0.0, cos_theta);
+
+                // Jeśli jesteśmy bardzo blisko bieguna, używamy stabilnego kierunku
+                if sin_phi.abs() < 1e-6 {
+                    tangent_xyz = Vec3::new(1.0, 0.0, 0.0);
+                } else {
+                    tangent_xyz = tangent_xyz.normalize();
+                }
+
+                let tangent = Vec4::new(tangent_xyz.x, tangent_xyz.y, tangent_xyz.z, 1.0);
+
+                // Poprawka: przekazujemy position jako pierwszy argument, normal jako drugi
+                vertices.push(Vertex::new(position, normal, tangent, uv));
             }
         }
 
@@ -99,7 +118,16 @@ impl Mesh {
             for slice in 0..slices {
                 let first = stack * (slices + 1) + slice;
                 let second = first + slices + 1;
-                indices.extend_from_slice(&[first, first + 1, second, second, first + 1, second + 1]);
+
+                // Standardowe trójkąty dla siatki UV
+                indices.extend_from_slice(&[
+                    first,
+                    first + 1,
+                    second,
+                    first + 1,
+                    second + 1,
+                    second,
+                ]);
             }
         }
 
@@ -114,20 +142,43 @@ impl Mesh {
     pub fn cube() -> Self {
         let positions: [[f32; 3]; 24] = [
             // +Z face
-            [-1., -1.,  1.], [ 1., -1.,  1.], [ 1.,  1.,  1.], [-1.,  1.,  1.],
+            [-1., -1., 1.],
+            [1., -1., 1.],
+            [1., 1., 1.],
+            [-1., 1., 1.],
             // -Z face
-            [ 1., -1., -1.], [-1., -1., -1.], [-1.,  1., -1.], [ 1.,  1., -1.],
+            [1., -1., -1.],
+            [-1., -1., -1.],
+            [-1., 1., -1.],
+            [1., 1., -1.],
             // +X face
-            [ 1., -1.,  1.], [ 1., -1., -1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
+            [1., -1., 1.],
+            [1., -1., -1.],
+            [1., 1., -1.],
+            [1., 1., 1.],
             // -X face
-            [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1.,  1.], [-1.,  1., -1.],
+            [-1., -1., -1.],
+            [-1., -1., 1.],
+            [-1., 1., 1.],
+            [-1., 1., -1.],
             // +Y face
-            [-1.,  1.,  1.], [ 1.,  1.,  1.], [ 1.,  1., -1.], [-1.,  1., -1.],
+            [-1., 1., 1.],
+            [1., 1., 1.],
+            [1., 1., -1.],
+            [-1., 1., -1.],
             // -Y face
-            [-1., -1., -1.], [ 1., -1., -1.], [ 1., -1.,  1.], [-1., -1.,  1.],
+            [-1., -1., -1.],
+            [1., -1., -1.],
+            [1., -1., 1.],
+            [-1., -1., 1.],
         ];
         let normals: [[f32; 3]; 6] = [
-            [0., 0., 1.], [0., 0., -1.], [1., 0., 0.], [-1., 0., 0.], [0., 1., 0.], [0., -1., 0.],
+            [0., 0., 1.],
+            [0., 0., -1.],
+            [1., 0., 0.],
+            [-1., 0., 0.],
+            [0., 1., 0.],
+            [0., -1., 0.],
         ];
         let uvs: [[f32; 2]; 4] = [[0., 1.], [1., 1.], [1., 0.], [0., 0.]];
 

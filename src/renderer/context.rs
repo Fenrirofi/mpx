@@ -11,9 +11,11 @@ use super::{
     ibl::{bake_ibl, IblMaps},
     pipeline,
     post::{PostParams, PostProcessor},
-    shadow::ShadowRenderer,
+    shadow::{CsmRenderer, NUM_CASCADES},
     skybox::{SkyboxRenderer, SkyUniform},
     ssao::SsaoRenderer,
+    ssr::SsrRenderer,
+    taa::TaaRenderer,
     texture,
     uniforms::{CameraUniform, EnvUniform, LightArrayUniform, MaterialUniform, ObjectUniform},
 };
@@ -34,61 +36,56 @@ pub struct RenderContext {
     config:     wgpu::SurfaceConfiguration,
     size:       PhysicalSize<u32>,
 
-    // Layouts (kept alive)
     _camera_bgl:       wgpu::BindGroupLayout,
     _object_bgl:       wgpu::BindGroupLayout,
     _material_bgl:     wgpu::BindGroupLayout,
     lights_shadow_bgl: wgpu::BindGroupLayout,
 
-    // Pipelines
     pbr_pipeline:     wgpu::RenderPipeline,
     gbuffer_pipeline: wgpu::RenderPipeline,
 
-    // Per-frame uniforms
     camera_uniform_buf: wgpu::Buffer,
     camera_bind_group:  wgpu::BindGroup,
     lights_uniform_buf: wgpu::Buffer,
+    lights_shadow_bg:   wgpu::BindGroup,
 
-    // Group 3 bind group (lights + shadow + IBL) — rebuilt when IBL loads
-    lights_shadow_bg: wgpu::BindGroup,
-
-    // Render targets
+    depth_tex:    wgpu::Texture,
     depth_view:   wgpu::TextureView,
-    gbuffer_tex:  wgpu::Texture,
-    gbuffer_view: wgpu::TextureView,
+    gbuffer_normals_tex:  wgpu::Texture,
+    gbuffer_normals_view: wgpu::TextureView,
+    gbuffer_mr_tex:  wgpu::Texture,
+    gbuffer_mr_view: wgpu::TextureView,
 
-    // Fallback textures
     white_view:       wgpu::TextureView,
     flat_normal_view: wgpu::TextureView,
     default_sampler:  wgpu::Sampler,
 
-    // Fallback IBL (1×1 black cubemap + 1×1 LUT)
     fallback_cube_view: wgpu::TextureView,
     fallback_lut_view:  wgpu::TextureView,
     fallback_sampler:   wgpu::Sampler,
 
-    // Sub-renderers
-    pub shadow: ShadowRenderer,
+    pub shadow: CsmRenderer,
     pub skybox: SkyboxRenderer,
     pub post:   PostProcessor,
     pub ssao:   SsaoRenderer,
+    pub taa:    TaaRenderer,
+    pub ssr:    SsrRenderer,
     pub ibl:    Option<IblMaps>,
 
-    // Scene GPU objects
     gpu_objects: Vec<GpuObject>,
 
-    // State
-    pub sky_uniform:       SkyUniform,
-    pub post_params:       PostParams,
-    frame_time:            f32,
-    pub env_rotation_yaw:  f32,
-    env_uniform_buf:       wgpu::Buffer,
+    pub sky_uniform:      SkyUniform,
+    pub post_params:      PostParams,
+    frame_time:           f32,
+    pub env_rotation_yaw: f32,
+    env_uniform_buf:      wgpu::Buffer,
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_gbuffer_tex(device: &wgpu::Device, w: u32, h: u32, label: &str)
+    -> (wgpu::Texture, wgpu::TextureView)
+{
     let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gbuffer_normals"),
+        label: Some(label),
         size:  wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
         mip_level_count: 1, sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -100,44 +97,70 @@ fn create_gbuffer(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu
     (tex, view)
 }
 
-fn create_gbuffer_pipeline(device: &wgpu::Device, cam: &wgpu::BindGroupLayout, obj: &wgpu::BindGroupLayout) -> wgpu::RenderPipeline {
+fn create_gbuffer_pipeline(
+    device:  &wgpu::Device,
+    cam:     &wgpu::BindGroupLayout,
+    obj:     &wgpu::BindGroupLayout,
+    mat_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("gbuffer"), source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/gbuffer.wgsl").into()),
+        label: Some("gbuffer"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/gbuffer.wgsl").into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("gbuffer_layout"), bind_group_layouts: &[cam, obj], immediate_size: 0,
+        label: Some("gbuffer_layout"),
+        bind_group_layouts: &[cam, obj, mat_bgl],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("gbuffer_pipeline"), layout: Some(&layout),
-        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_main"),
-            buffers: &[crate::assets::Vertex::buffer_layout()], compilation_options: Default::default() },
-        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back), ..Default::default() },
-        depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false, depth_compare: wgpu::CompareFunction::LessEqual,
-            stencil: Default::default(), bias: Default::default() }),
+        vertex: wgpu::VertexState {
+            module: &shader, entry_point: Some("vs_main"),
+            buffers: &[crate::assets::Vertex::buffer_layout()],
+            compilation_options: Default::default(),
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back), ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(), bias: Default::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba16Float,
-                blend: Some(wgpu::BlendState::REPLACE), write_mask: wgpu::ColorWrites::ALL })],
-            compilation_options: Default::default() }),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader, entry_point: Some("fs_main"),
+            targets: &[
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+            compilation_options: Default::default(),
+        }),
         multiview_mask: None, cache: None,
     })
 }
 
-/// Create a 1×1 black cubemap as IBL fallback.
 fn create_fallback_cubemap(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("fallback_cube"),
         size:  wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
         mip_level_count: 1, sample_count: 1,
-        dimension:    wgpu::TextureDimension::D2,
-        format:       wgpu::TextureFormat::Rgba16Float,
-        usage:        wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        dimension: wgpu::TextureDimension::D2,
+        format:    wgpu::TextureFormat::Rgba16Float,
+        usage:     wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    // Write 6 black faces (4×u16 f16 = 8 bytes per texel, 6 faces)
-    let black_f16: [u16; 4] = [0, 0, 0, 0x3c00]; // rgba = (0,0,0,1) in f16
+    let black_f16: [u16; 4] = [0, 0, 0, 0x3c00];
     let face_data: Vec<u8> = black_f16.iter().flat_map(|v| v.to_le_bytes()).collect();
     for face in 0..6u32 {
         queue.write_texture(
@@ -153,13 +176,11 @@ fn create_fallback_cubemap(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu:
     }
     let view = tex.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(wgpu::TextureViewDimension::Cube),
-        array_layer_count: Some(6),
-        ..Default::default()
+        array_layer_count: Some(6), ..Default::default()
     });
     (tex, view)
 }
 
-/// Create a 1×1 LUT fallback (maps to env_brdf = (1,0)).
 fn create_fallback_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("fallback_lut"),
@@ -170,7 +191,6 @@ fn create_fallback_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Tex
         usage:     wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    // (1.0, 0.0, 0.0, 1.0) in f16
     let data: [u16; 4] = [0x3c00, 0, 0, 0x3c00];
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
     queue.write_texture(tex.as_image_copy(), &bytes,
@@ -181,26 +201,25 @@ fn create_fallback_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Tex
 }
 
 impl RenderContext {
-    // ── Build group-3 bind group (lights + shadow + IBL or fallbacks) ─────────
     fn build_lights_shadow_bg(
-        device:              &wgpu::Device,
-        bgl:                 &wgpu::BindGroupLayout,
-        lights_buf:          &wgpu::Buffer,
-        shadow:              &ShadowRenderer,
-        irradiance_view:     &wgpu::TextureView,
-        prefilter_view:      &wgpu::TextureView,
-        lut_view:            &wgpu::TextureView,
-        ibl_sampler:         &wgpu::Sampler,
-        lut_sampler:         &wgpu::Sampler,
-        env_uniform_buf:     &wgpu::Buffer,
+        device:          &wgpu::Device,
+        bgl:             &wgpu::BindGroupLayout,
+        lights_buf:      &wgpu::Buffer,
+        shadow:          &CsmRenderer,
+        irradiance_view: &wgpu::TextureView,
+        prefilter_view:  &wgpu::TextureView,
+        lut_view:        &wgpu::TextureView,
+        ibl_sampler:     &wgpu::Sampler,
+        lut_sampler:     &wgpu::Sampler,
+        env_uniform_buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights_shadow_ibl_bg"),
             layout: bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: lights_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: shadow.uniform_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&shadow.shadow_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: shadow.pbr_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&shadow.shadow_array_view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&shadow.sampler) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(irradiance_view) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(prefilter_view) },
@@ -234,8 +253,11 @@ impl RenderContext {
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
         }).await?;
 
-        let caps   = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let caps = surface.get_capabilities(&adapter);
+        // Wybierz non-sRGB — gamma korekcja jest robiona ręcznie w post.wgsl
+        let format = caps.formats.iter().copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format, width: size.width.max(1), height: size.height.max(1),
@@ -245,23 +267,21 @@ impl RenderContext {
         };
         surface.configure(&device, &config);
 
-        // ── Layouts ───────────────────────────────────────────────────────────
         let camera_bgl        = pipeline::camera_bind_group_layout(&device);
         let object_bgl        = pipeline::object_bind_group_layout(&device);
         let material_bgl      = pipeline::material_bind_group_layout(&device);
         let lights_shadow_bgl = pipeline::lights_shadow_bind_group_layout(&device);
 
-        // ── Sub-renderers ─────────────────────────────────────────────────────
-        let shadow = ShadowRenderer::new(&device);
+        let shadow = CsmRenderer::new(&device);
         let skybox = SkyboxRenderer::new(&device, wgpu::TextureFormat::Rgba16Float, &camera_bgl);
         let post   = PostProcessor::new(&device, &queue, config.width, config.height, format);
         let ssao   = SsaoRenderer::new(&device, &queue, config.width, config.height);
+        let taa    = TaaRenderer::new(&device, config.width, config.height);
+        let ssr    = SsrRenderer::new(&device, config.width, config.height);
 
-        // ── Pipelines ─────────────────────────────────────────────────────────
         let pbr_pipeline     = pipeline::create_pbr_pipeline(&device, &camera_bgl, &object_bgl, &material_bgl, &lights_shadow_bgl);
-        let gbuffer_pipeline = create_gbuffer_pipeline(&device, &camera_bgl, &object_bgl);
+        let gbuffer_pipeline = create_gbuffer_pipeline(&device, &camera_bgl, &object_bgl, &material_bgl);
 
-        // ── Uniform buffers ───────────────────────────────────────────────────
         let camera_uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera_buf"), size: std::mem::size_of::<CameraUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
@@ -275,38 +295,31 @@ impl RenderContext {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
         });
 
-        // ── Render targets ────────────────────────────────────────────────────
-        let (_, depth_view)      = texture::create_depth_texture(&device, config.width, config.height);
-        let (gbuffer_tex, gbuffer_view) = create_gbuffer(&device, config.width, config.height);
+        let (depth_tex, depth_view) = texture::create_depth_texture(&device, config.width, config.height);
+        let (gn_tex, gn_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_normals");
+        let (gm_tex, gm_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_mr");
 
-        // ── Fallback textures ─────────────────────────────────────────────────
         let (_, white_view, default_sampler) = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "white");
         let (_, flat_normal_view, _)         = texture::create_fallback_texture(&device, &queue, [128,128,255,255], "flat_normal");
 
-        // ── Fallback IBL (black cubemap + identity LUT) ───────────────────────
-        let (_fallback_cube_tex, fallback_cube_view) = create_fallback_cubemap(&device, &queue);
-        let (_fallback_lut_tex,  fallback_lut_view)  = create_fallback_lut(&device, &queue);
+        let (_fb_cube_tex, fallback_cube_view) = create_fallback_cubemap(&device, &queue);
+        let (_fb_lut_tex,  fallback_lut_view)  = create_fallback_lut(&device, &queue);
         let fallback_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("fallback_ibl_sampler"),
             mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
+            mipmap_filter: wgpu::MipmapFilterMode::Linear, ..Default::default()
         });
 
-        // ── Env rotation uniform buffer ───────────────────────────────────────
         let env_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("env_uniform_buf"),
             contents: bytemuck::bytes_of(&EnvUniform::identity()),
             usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        // ── Initial lights_shadow_bg with fallback IBL ────────────────────────
         let lights_shadow_bg = Self::build_lights_shadow_bg(
-            &device, &lights_shadow_bgl,
-            &lights_uniform_buf, &shadow,
+            &device, &lights_shadow_bgl, &lights_uniform_buf, &shadow,
             &fallback_cube_view, &fallback_cube_view, &fallback_lut_view,
-            &fallback_sampler, &fallback_sampler,
-            &env_uniform_buf,
+            &fallback_sampler, &fallback_sampler, &env_uniform_buf,
         );
 
         let mut ctx = Self {
@@ -316,10 +329,12 @@ impl RenderContext {
             pbr_pipeline, gbuffer_pipeline,
             camera_uniform_buf, camera_bind_group,
             lights_uniform_buf, lights_shadow_bg,
-            depth_view, gbuffer_tex, gbuffer_view,
+            depth_tex, depth_view,
+            gbuffer_normals_tex: gn_tex, gbuffer_normals_view: gn_view,
+            gbuffer_mr_tex: gm_tex, gbuffer_mr_view: gm_view,
             white_view, flat_normal_view, default_sampler,
             fallback_cube_view, fallback_lut_view, fallback_sampler,
-            shadow, skybox, post, ssao, ibl: None,
+            shadow, skybox, post, ssao, taa, ssr, ibl: None,
             gpu_objects: Vec::new(),
             sky_uniform: SkyUniform::day(),
             post_params: PostParams::default(),
@@ -331,24 +346,18 @@ impl RenderContext {
         Ok(ctx)
     }
 
-    // ── Load HDR and rebuild group-3 bind group with real IBL ─────────────────
     pub fn load_hdr(&mut self, path: &str) -> Result<()> {
         let maps = bake_ibl(&self.device, &self.queue, path)?;
-
         self.lights_shadow_bg = Self::build_lights_shadow_bg(
-            &self.device, &self.lights_shadow_bgl,
-            &self.lights_uniform_buf, &self.shadow,
+            &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
             &maps.irradiance_view, &maps.prefilter_view, &maps.brdf_lut_view,
-            &maps.sampler, &maps.lut_sampler,
-            &self.env_uniform_buf,
+            &maps.sampler, &maps.lut_sampler, &self.env_uniform_buf,
         );
-
         self.ibl = Some(maps);
-        log::info!("IBL loaded and wired into PBR pipeline.");
+        log::info!("IBL loaded.");
         Ok(())
     }
 
-    // ── Internal ──────────────────────────────────────────────────────────────
     fn create_gpu_object(&self, mesh: &crate::assets::Mesh, material: &crate::assets::Material) -> GpuObject {
         let gpu_mesh = GpuMesh::upload(&self.device, mesh);
 
@@ -401,20 +410,39 @@ impl RenderContext {
         self.config.width  = new_size.width.max(1);
         self.config.height = new_size.height.max(1);
         self.surface.configure(&self.device, &self.config);
-        let (_, dv) = texture::create_depth_texture(&self.device, self.config.width, self.config.height);
+        let (dt, dv) = texture::create_depth_texture(&self.device, self.config.width, self.config.height);
+        self.depth_tex  = dt;
         self.depth_view = dv;
-        let (gt, gv) = create_gbuffer(&self.device, self.config.width, self.config.height);
-        self.gbuffer_tex  = gt;
-        self.gbuffer_view = gv;
+        let (gnt, gnv) = create_gbuffer_tex(&self.device, self.config.width, self.config.height, "gbuf_normals");
+        let (gmt, gmv) = create_gbuffer_tex(&self.device, self.config.width, self.config.height, "gbuf_mr");
+        self.gbuffer_normals_tex  = gnt; self.gbuffer_normals_view = gnv;
+        self.gbuffer_mr_tex  = gmt;      self.gbuffer_mr_view      = gmv;
         self.post.resize(&self.device, &self.queue, self.config.width, self.config.height, self.config.format);
         self.ssao.resize(&self.device, &self.queue, self.config.width, self.config.height);
+        self.taa.resize(&self.device, self.config.width, self.config.height);
+        self.ssr.resize(&self.device, self.config.width, self.config.height);
     }
 
     pub fn render(&mut self, scene: &Scene) -> Result<(), wgpu::SurfaceError> {
         self.frame_time += 1.0 / 60.0;
 
-        self.queue.write_buffer(&self.camera_uniform_buf, 0,
-            bytemuck::bytes_of(&CameraUniform::from_camera(&scene.camera)));
+        // ── Jitter TAA — geometry dostaje jittered VP, TAA reprojekcja dostaje czyste ──
+        let (jx, jy)       = self.taa.jitter(self.config.width, self.config.height);
+        let unjittered_vp  = scene.camera.view_proj();
+        let mut jitter_proj = scene.camera.proj();
+        jitter_proj.w_axis.x += jx;
+        jitter_proj.w_axis.y += jy;
+        let jittered_vp = jitter_proj * scene.camera.view();
+
+        // Camera uniform: jittered VP (dla geometrii i depth)
+        let cam_u = CameraUniform {
+            view_proj:  jittered_vp.to_cols_array_2d(),
+            view:       scene.camera.view().to_cols_array_2d(),
+            proj:       jitter_proj.to_cols_array_2d(),
+            camera_pos: [scene.camera.position.x, scene.camera.position.y,
+                         scene.camera.position.z, 1.0],
+        };
+        self.queue.write_buffer(&self.camera_uniform_buf, 0, bytemuck::bytes_of(&cam_u));
         self.queue.write_buffer(&self.lights_uniform_buf, 0,
             bytemuck::bytes_of(&LightArrayUniform::from_scene(scene)));
         self.queue.write_buffer(&self.env_uniform_buf, 0,
@@ -425,7 +453,6 @@ impl RenderContext {
             .map(|l| l.position_or_direction.normalize())
             .unwrap_or(Vec3::new(0.4, 0.8, 0.3).normalize());
 
-        // Rotate sun to stay consistent with env rotation
         let yaw = self.env_rotation_yaw;
         let (s, c) = yaw.sin_cos();
         let rotated_sun = Vec3::new(
@@ -434,8 +461,15 @@ impl RenderContext {
             -sun_dir.x * s + sun_dir.z * c,
         );
 
-        let light_vp = ShadowRenderer::compute_light_matrix(rotated_sun, Vec3::ZERO, 8.0);
-        self.shadow.update(&self.queue, light_vp);
+        // ── CSM ───────────────────────────────────────────────────────────────
+        let near = scene.camera.near;
+        let far  = scene.camera.far;
+        let splits   = CsmRenderer::compute_cascade_splits(near, far);
+        let matrices = CsmRenderer::compute_cascade_matrices(
+            rotated_sun, scene.camera.view(), scene.camera.proj(), near, &splits,
+        );
+        self.shadow.update(&self.queue, &matrices, &splits);
+
         self.sky_uniform.sun_direction = [rotated_sun.x, rotated_sun.y, rotated_sun.z, 0.0];
         self.skybox.update(&self.queue, &self.sky_uniform);
 
@@ -452,6 +486,10 @@ impl RenderContext {
         self.ssao.update_params(&self.queue,
             scene.camera.proj(), scene.camera.proj().inverse(), scene.camera.view(),
             self.config.width, self.config.height);
+        self.ssr.update_params(&self.queue, scene.camera.proj(), scene.camera.view());
+
+        // FIX: TAA dostaje unjittered VP — reprojekcja musi być precyzyjna
+        self.taa.update_params(&self.queue, unjittered_vp);
 
         let mut pp = self.post_params; pp.time = self.frame_time;
         self.post.update_params(&self.queue, &pp);
@@ -459,18 +497,20 @@ impl RenderContext {
         let mut encoder = self.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
-        // Pass 1: Shadow
-        {
+        // ── Pass 1: CSM Shadow ────────────────────────────────────────────────
+        for cascade in 0..NUM_CASCADES {
+            let cascade_view = self.shadow.set_cascade(&self.queue, cascade);
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shadow"), color_attachments: &[],
+                label: Some(&format!("shadow_cascade_{cascade}")),
+                color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.shadow.shadow_view,
+                    view: cascade_view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }), ..Default::default()
             });
             rp.set_pipeline(&self.shadow.pipeline);
-            rp.set_bind_group(0, &self.shadow.uniform_bg, &[]);
+            rp.set_bind_group(0, &self.shadow.csm_uniform_bg, &[]);
             for (i, _) in scene.objects.iter().enumerate() {
                 if i >= self.gpu_objects.len() { break; }
                 let g = &self.gpu_objects[i];
@@ -481,7 +521,7 @@ impl RenderContext {
             }
         }
 
-        // Pass 2: Skybox → HDR
+        // ── Pass 2: Skybox → HDR ──────────────────────────────────────────────
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sky"),
@@ -501,8 +541,23 @@ impl RenderContext {
             rp.draw(0..3, 0..1);
         }
 
-        // Pass 3: PBR geometry → HDR
+        // ── Pass 3: PBR geometry → HDR ────────────────────────────────────────
         {
+            // FIX: przebuduj lights_shadow_bg tylko raz na klatkę tu (nie w każdej pętli)
+            let lights_shadow_bg = {
+                let (irr, pre, lut, ibl_s, lut_s) = if let Some(ibl) = &self.ibl {
+                    (&ibl.irradiance_view, &ibl.prefilter_view, &ibl.brdf_lut_view, &ibl.sampler, &ibl.lut_sampler)
+                } else {
+                    (&self.fallback_cube_view, &self.fallback_cube_view, &self.fallback_lut_view,
+                     &self.fallback_sampler, &self.fallback_sampler)
+                };
+                Self::build_lights_shadow_bg(
+                    &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
+                    irr, pre, lut, ibl_s, lut_s, &self.env_uniform_buf,
+                )
+            };
+            self.lights_shadow_bg = lights_shadow_bg;
+
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pbr"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -529,14 +584,20 @@ impl RenderContext {
             }
         }
 
-        // Pass 4: GBuffer
+        // ── Pass 4: GBuffer (normals + metallic/roughness) ────────────────────
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gbuffer"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.gbuffer_view, resolve_target: None, depth_slice: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                })],
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.gbuffer_normals_view, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.gbuffer_mr_view, resolve_target: None, depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
@@ -549,19 +610,45 @@ impl RenderContext {
                 if i >= self.gpu_objects.len() { break; }
                 let g = &self.gpu_objects[i];
                 rp.set_bind_group(1, &g.object_bind_group, &[]);
+                rp.set_bind_group(2, &g.material_bind_group, &[]);
                 rp.set_vertex_buffer(0, g.mesh.vertex_buffer.slice(..));
                 rp.set_index_buffer(g.mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 rp.draw_indexed(0..g.mesh.index_count, 0, 0..1);
             }
         }
 
-        // Pass 5: SSAO
-        self.ssao.render(&self.device, &mut encoder, &self.depth_view, &self.gbuffer_view);
+        // ── Pass 5: SSAO ──────────────────────────────────────────────────────
+        self.ssao.render(&self.device, &mut encoder, &self.depth_view, &self.gbuffer_normals_view);
 
-        // Pass 6-9: Post → swapchain
+        // ── Pass 6: SSR ───────────────────────────────────────────────────────
+        self.ssr.render(&self.device, &mut encoder,
+            &self.post.hdr_view, &self.depth_view,
+            &self.gbuffer_normals_view, &self.gbuffer_mr_view);
+
+        // ── Pass 7: TAA ───────────────────────────────────────────────────────
+        // FIX: przekaż unjittered VP — reprojekcja musi używać czystej macierzy
+        self.taa.render(&self.device, &mut encoder, &self.post.hdr_view, &self.depth_view, unjittered_vp);
+
+        // FIX: skopiuj TAA output → hdr_texture żeby post-processing go zobaczył
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.taa.output_tex, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.post.hdr_texture, mip_level: 0,
+                origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+        );
+
+        // ── Pass 8: Post → swapchain ──────────────────────────────────────────
         let output     = self.surface.get_current_texture()?;
         let final_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.post.render(&self.device, &mut encoder, &final_view, &self.ssao.ao_blur_view);
+
+        // FIX: advance_frame dostaje unjittered VP
+        self.taa.advance_frame(unjittered_vp);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();

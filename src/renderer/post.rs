@@ -112,7 +112,7 @@ fn hdr_texture(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::T
         sample_count:    1,
         dimension:       wgpu::TextureDimension::D2,
         format:          wgpu::TextureFormat::Rgba16Float,
-        usage:           wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage:           wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats:    &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());

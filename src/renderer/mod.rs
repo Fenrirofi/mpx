@@ -8,5 +8,7 @@ pub mod shadow;
 pub mod post;
 pub mod ibl;
 pub mod ssao;
+pub mod taa;
+pub mod ssr;
 
 pub use context::RenderContext;
