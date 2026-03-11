@@ -16,9 +16,11 @@ pub struct ShadowUniform {
 
 impl ShadowUniform {
     pub fn new(light_view_proj: Mat4, enabled: bool) -> Self {
+        // z = texel_size = 1.0 / shadow_map_resolution — używane przez PCF w shaderze
+        let texel_size = 1.0 / SHADOW_MAP_SIZE as f32;
         Self {
             light_view_proj: light_view_proj.to_cols_array_2d(),
-            shadow_params: [0.001, 0.003, 1.5, if enabled { 1.0 } else { 0.0 }],
+            shadow_params: [0.001, 0.003, texel_size, if enabled { 1.0 } else { 0.0 }],
         }
     }
 }

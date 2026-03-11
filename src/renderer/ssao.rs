@@ -6,6 +6,9 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
+use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::SeedableRng;
 use wgpu::util::DeviceExt;
 
 pub const KERNEL_SIZE: usize = 32;
@@ -26,17 +29,19 @@ pub struct SsaoParams {
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 { a + t * (b - a) }
 
-/// Generate a cosine-weighted hemisphere kernel (view space).
+/// Generate a random hemisphere kernel (view space).
+/// Używamy prawdziwego RNG zamiast złotej proporcji — ta dawała widoczne powtarzające się wzorce.
 pub fn generate_ssao_kernel() -> Vec<[f32; 4]> {
+    let mut rng = SmallRng::seed_from_u64(0xDEAD_BEEF_1234_5678);
     let mut kernel = Vec::with_capacity(KERNEL_SIZE);
     for i in 0..KERNEL_SIZE {
         let scale = i as f32 / KERNEL_SIZE as f32;
         let scale = lerp(0.1, 1.0, scale * scale);
-        let fi    = i as f32;
-        let x     = (fi * 1.618033988 % 1.0) * 2.0 - 1.0;
-        let y     = (fi * 0.381966011 % 1.0) * 2.0 - 1.0;
-        let z     = (fi * 0.618033988 % 1.0) * 0.9 + 0.1; // z ∈ [0.1, 1.0) — nigdy 0
-        let v     = Vec3::new(x, y, z).normalize() * scale;
+        let v = Vec3::new(
+            rng.gen::<f32>() * 2.0 - 1.0,
+            rng.gen::<f32>() * 2.0 - 1.0,
+            rng.gen::<f32>(),           // z ∈ [0, 1) — hemisfera, nie sfera
+        ).normalize() * scale;
         kernel.push([v.x, v.y, v.z, 0.0]);
     }
     kernel
@@ -44,14 +49,14 @@ pub fn generate_ssao_kernel() -> Vec<[f32; 4]> {
 
 /// Generate 4×4 random rotation noise texture.
 pub fn generate_noise_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView) {
+    let mut rng = SmallRng::seed_from_u64(0xCAFE_BABE_9876_5432);
     let mut noise = vec![0f32; 16 * 3];
     for i in 0..16 {
-        let fi  = i as f32;
-        noise[i*3]   = (fi * 1.618033988 % 1.0) * 2.0 - 1.0;
-        noise[i*3+1] = (fi * 2.618033988 % 1.0) * 2.0 - 1.0;
-        noise[i*3+2] = 0.0; // z=0 for rotation in xy plane
+        noise[i*3]   = rng.gen::<f32>() * 2.0 - 1.0;
+        noise[i*3+1] = rng.gen::<f32>() * 2.0 - 1.0;
+        noise[i*3+2] = 0.0; // z=0 — rotacja tylko w płaszczyźnie XY
     }
-    // Pad RGB → RGBA
+    // Pad RGB → RGBA (GPU wymaga wyrównanego formatu)
     let rgba: Vec<f32> = noise.chunks(3).flat_map(|c| [c[0], c[1], c[2], 1.0]).collect();
 
     let tex = device.create_texture(&wgpu::TextureDescriptor {

@@ -70,36 +70,11 @@ fn mie_phase(cos_theta: f32, g: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let dir        = normalize(in.world_dir);
-    let sun_dir    = normalize(sky.sun_direction.xyz);
-    let cos_theta  = dot(dir, sun_dir);
-    let up         = vec3<f32>(0.0, 1.0, 0.0);
-    let horizon_t  = clamp(dir.y * 4.0 + 0.5, 0.0, 1.0);
-    let ground_t   = clamp(-dir.y * 8.0, 0.0, 1.0);
-
-    // Sky gradient: ground → horizon → zenith
-    var sky_color  = mix(sky.sky_color_horiz.rgb, sky.sky_color_top.rgb, pow(max(dir.y, 0.0), 0.5));
-    sky_color      = mix(sky_color, sky.ground_color.rgb, ground_t);
-
-    // Rayleigh: blue scatter near horizon
-    let rayleigh   = rayleigh_phase(cos_theta);
-    let scatter    = vec3<f32>(0.12, 0.24, 0.6) * rayleigh * 0.3 * max(dir.y + 0.2, 0.0);
-    sky_color     += scatter;
-
-    // Mie: halo around sun
-    let sun_halo   = sky.params.y;
-    let halo       = mie_phase(cos_theta, 0.85) * sky.sun_color.rgb * sky.sun_color.a * 0.002;
-    sky_color     += halo;
-
-    // Sun disk
-    let sun_size   = sky.params.x;
-    let sun_edge   = smoothstep(sun_size * 1.02, sun_size, cos_theta);
-    let sun_limb   = smoothstep(sun_size * 0.98, sun_size * 1.0, cos_theta); // limb darkening
-    let sun_bright = sky.sun_color.rgb * sky.sun_color.a * sun_edge * mix(0.7, 1.0, sun_limb);
-    sky_color     += sun_bright;
-
-    // Exposure + output (skybox feeds into HDR buffer, tone map in post)
-    sky_color *= sky.params.z;
-
-    return vec4<f32>(sky_color, 1.0);
+    // Target output: #2E2E2E (sRGB 46/255 = 0.1804)
+    // Pipeline: HDR → ACES filmic → gamma 2.2
+    // Inverse: 0.1804^2.2 = 0.02310 (linear target)
+    // Inverse ACES at 0.02310 ≈ 0.03312
+    // Exposure default = 0 → pow(2,0) = 1, no change needed
+    let v = 0.03312;
+    return vec4<f32>(v, v, v, 1.0);
 }

@@ -80,6 +80,8 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 state.controller.update_camera(&mut state.scene.camera);
+                // Sync environment rotation from controller to renderer
+                state.render_ctx.env_rotation_yaw = state.controller.env_rotation_yaw;
 
                 // FPS counter
                 state.fps_frames += 1;
@@ -92,11 +94,12 @@ impl ApplicationHandler for App {
                     let cam  = &state.scene.camera;
                     let ctrl = &state.controller;
                     let title = format!(
-                        "PBR Engine  |  {:.0} fps  |  dist:{:.2}  yaw:{:.1}°  pitch:{:.1}°  |  LMB:orbit  MMB:pan  Scroll:zoom  F:reset",
+                        "PBR Engine  |  {:.0} fps  |  dist:{:.2}  yaw:{:.1}°  pitch:{:.1}°  env:{:.1}°  |  LMB:orbit  Shift+LMB:env  MMB:pan  Scroll:zoom  F:reset  R:reset env",
                         state.fps_last,
                         ctrl.radius,
                         ctrl.yaw.to_degrees(),
                         ctrl.pitch.to_degrees(),
+                        ctrl.env_rotation_yaw.to_degrees(),
                     );
                     state.window.set_title(&title);
                 }

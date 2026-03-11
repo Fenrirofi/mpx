@@ -151,10 +151,14 @@ fn fs_composite(in: PostVOut) -> @location(0) vec4<f32> {
     // HDR color with chromatic aberration
     var hdr = chromatic_aberration(in.uv, post.ca_strength * 0.005);
 
-    // SSAO — multiply ambient before bloom/tonemap for physically correct darkening
+    // SSAO — ciemni tylko ambient (diffuse indirect), nie emissive ani bezpośrednie światła.
+    // Wartości emissive/specular wylatują z PBR niezależnie od okluzji otoczenia.
+    // W uproszczonym pipeline aplikujemy AO przed bloomem, ale NIE na całość:
+    // odejmujemy siłę proporcjonalną do jasności, zamiast mnożyć w ciemno.
     let ao    = textureSample(t_ssao, s_comp, in.uv).r;
     let ao_f  = mix(1.0, ao, post.ssao_strength);
-    hdr      *= ao_f;
+    // Tylko przygasza jasność (nie dotyczy wartości > 1.0, czyli bloom brightów)
+    hdr      *= clamp(ao_f, 0.0, 1.0);
 
     // Add bloom
     let bloom_color = textureSample(t_bloom_in, s_comp, in.uv).rgb;

@@ -2,6 +2,41 @@ use bytemuck::{Pod, Zeroable};
 use crate::scene::{Camera, Scene};
 use crate::scene::light::LightKind;
 
+/// Environment rotation uniform — passed to PBR + skybox shaders.
+/// Contains a 3×3 rotation matrix (padded to mat4x4 for WGSL alignment).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct EnvUniform {
+    /// Column-major mat3x3 rotation, padded as mat4x4 (rows 0-2 used, w=0).
+    pub rotation: [[f32; 4]; 4],
+}
+
+impl EnvUniform {
+    pub fn identity() -> Self {
+        Self {
+            rotation: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Build from a yaw rotation around Y axis (radians).
+    pub fn from_yaw(yaw: f32) -> Self {
+        let (s, c) = yaw.sin_cos();
+        Self {
+            rotation: [
+                [ c,  0.0, s, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [-s, 0.0,  c, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct CameraUniform {

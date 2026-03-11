@@ -39,6 +39,7 @@ struct LightArrayUniform {
 }
 struct ShadowUniform {
     light_view_proj: mat4x4<f32>,
+    // x = min_bias, y = slope_bias, z = texel_size (1.0/shadow_map_resolution)
     shadow_params:   vec4<f32>,
 }
 @group(3) @binding(0) var<uniform> lights:      LightArrayUniform;
@@ -50,6 +51,9 @@ struct ShadowUniform {
 @group(3) @binding(6) var t_brdf_lut:            texture_2d<f32>;
 @group(3) @binding(7) var s_ibl:                 sampler;
 @group(3) @binding(8) var s_lut:                 sampler;
+
+struct EnvUniform { rotation: mat4x4<f32>, }
+@group(3) @binding(9) var<uniform> env: EnvUniform;
 
 const PI:       f32 = 3.14159265358979;
 const INV_PI:   f32 = 0.31830988618;
@@ -129,13 +133,17 @@ fn ibl(n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>, albedo: vec3<f32>,
     let ndv = max(dot(n, v), EPSILON);
     let r   = reflect(-v, n);
 
-    let irrad   = textureSample(t_irradiance, s_ibl, n).rgb * IBL_SCALE;
+    // Rotate sample directions by env rotation matrix
+    let n_rot = (env.rotation * vec4<f32>(n, 0.0)).xyz;
+    let r_rot = (env.rotation * vec4<f32>(r, 0.0)).xyz;
+
+    let irrad   = textureSample(t_irradiance, s_ibl, n_rot).rgb * IBL_SCALE;
     let F       = F_SchlickR(ndv, f0, perc_rough);
     let kd      = (1.0 - F) * (1.0 - metallic);
     let diffuse = kd * albedo * irrad;
 
     let lod       = perc_rough * MAX_PREFILTER_LOD;
-    let env_color = textureSampleLevel(t_prefilter, s_ibl, r, lod).rgb * IBL_SCALE;
+    let env_color = textureSampleLevel(t_prefilter, s_ibl, r_rot, lod).rgb * IBL_SCALE;
     let brdf_uv   = vec2<f32>(ndv, perc_rough);
     let brdf      = textureSample(t_brdf_lut, s_lut, brdf_uv).rg;
     let specular  = env_color * (f0 * brdf.x + brdf.y);
@@ -200,27 +208,31 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
              let p = in.shadow_coord.xyz/in.shadow_coord.w;
              let uv_sh = vec2<f32>(p.x*0.5+0.5, p.y*-0.5+0.5);
              let bias = max(shadow_data.shadow_params.y*(1.0-ndl), shadow_data.shadow_params.x);
-             shd = textureSampleCompare(t_shadow_map, s_shadow, uv_sh, p.z-bias);
+             // PCF 3×3 — miękkie cienie bez aliasingu
+             let texel = shadow_data.shadow_params.z; // rozmiar teksela shadow map
+             var pcf = 0.0;
+             for (var sx = -1; sx <= 1; sx++) {
+                 for (var sy = -1; sy <= 1; sy++) {
+                     let off = vec2<f32>(f32(sx), f32(sy)) * texel;
+                     pcf += textureSampleCompare(t_shadow_map, s_shadow, uv_sh + off, p.z - bias);
+                 }
+             }
+             shd = pcf / 9.0;
         }
         
-        let D   = D_GGX(ndh, roughness);
-        let Vis = V_Smith(ndv, ndl, roughness);
+        // D_GGX i V_Smith oczekują perceptual roughness — kwadratują wewnętrznie do alpha
+        let D   = D_GGX(ndh, perc_rough);
+        let Vis = V_Smith(ndv, ndl, perc_rough);
         let F   = F_Schlick(ldh, f0);
         let kd  = (1.0-F)*(1.0-metallic);
         lo += (kd*dc*Fd_Burley(ndv,ndl,ldh,perc_rough) + D*Vis*F) * radiance * ndl * shd;
     }
 
     let ambient  = ibl(n, v, f0, dc, metallic, perc_rough, ao);
-    var color = lo + ambient + material.emissive.rgb;
+    // Emissive NIE jest mnożone przez AO — świeci niezależnie
+    let color = lo + ambient + material.emissive.rgb;
 
-    // --- FINAL COLOR (Balanced) ---
-    // Tone mapping jest obowiązkowy dla HDR
-    color = tone_map_aces(color);
-
-    // Dithering usuwa schodkowanie
-    let noise = interleaved_gradient_noise(in.clip_pos.xy);
-    color += (noise - 0.5) / 255.0;
-
-    // UWAGA: Nie robimy pow(color, 1.0/2.2) bo wgpu/sRGB zrobi to za nas.
+    // Oddajemy surowy HDR — tone mapping i dithering są w post.wgsl (fs_composite).
+    // Nie wolno tu robić tone_map_aces() — post zrobi to drugi raz i obraz będzie zbyt ciemny.
     return vec4<f32>(color, alpha);
 }

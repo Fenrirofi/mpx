@@ -155,6 +155,13 @@ pub fn lights_shadow_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroup
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            // 9: env rotation uniform
+            wgpu::BindGroupLayoutEntry {
+                binding: 9, visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
         ],
     })
 }

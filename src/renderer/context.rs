@@ -15,7 +15,7 @@ use super::{
     skybox::{SkyboxRenderer, SkyUniform},
     ssao::SsaoRenderer,
     texture,
-    uniforms::{CameraUniform, LightArrayUniform, MaterialUniform, ObjectUniform},
+    uniforms::{CameraUniform, EnvUniform, LightArrayUniform, MaterialUniform, ObjectUniform},
 };
 
 struct GpuObject {
@@ -78,9 +78,11 @@ pub struct RenderContext {
     gpu_objects: Vec<GpuObject>,
 
     // State
-    pub sky_uniform: SkyUniform,
-    pub post_params: PostParams,
-    frame_time:      f32,
+    pub sky_uniform:       SkyUniform,
+    pub post_params:       PostParams,
+    frame_time:            f32,
+    pub env_rotation_yaw:  f32,
+    env_uniform_buf:       wgpu::Buffer,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -190,6 +192,7 @@ impl RenderContext {
         lut_view:            &wgpu::TextureView,
         ibl_sampler:         &wgpu::Sampler,
         lut_sampler:         &wgpu::Sampler,
+        env_uniform_buf:     &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights_shadow_ibl_bg"),
@@ -204,6 +207,7 @@ impl RenderContext {
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(lut_view) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(ibl_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(lut_sampler) },
+                wgpu::BindGroupEntry { binding: 9, resource: env_uniform_buf.as_entire_binding() },
             ],
         })
     }
@@ -289,12 +293,20 @@ impl RenderContext {
             ..Default::default()
         });
 
+        // ── Env rotation uniform buffer ───────────────────────────────────────
+        let env_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("env_uniform_buf"),
+            contents: bytemuck::bytes_of(&EnvUniform::identity()),
+            usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
         // ── Initial lights_shadow_bg with fallback IBL ────────────────────────
         let lights_shadow_bg = Self::build_lights_shadow_bg(
             &device, &lights_shadow_bgl,
             &lights_uniform_buf, &shadow,
             &fallback_cube_view, &fallback_cube_view, &fallback_lut_view,
             &fallback_sampler, &fallback_sampler,
+            &env_uniform_buf,
         );
 
         let mut ctx = Self {
@@ -312,6 +324,8 @@ impl RenderContext {
             sky_uniform: SkyUniform::day(),
             post_params: PostParams::default(),
             frame_time: 0.0,
+            env_rotation_yaw: 0.0,
+            env_uniform_buf,
         };
         ctx.upload_scene_placeholder();
         Ok(ctx)
@@ -326,6 +340,7 @@ impl RenderContext {
             &self.lights_uniform_buf, &self.shadow,
             &maps.irradiance_view, &maps.prefilter_view, &maps.brdf_lut_view,
             &maps.sampler, &maps.lut_sampler,
+            &self.env_uniform_buf,
         );
 
         self.ibl = Some(maps);
@@ -402,15 +417,26 @@ impl RenderContext {
             bytemuck::bytes_of(&CameraUniform::from_camera(&scene.camera)));
         self.queue.write_buffer(&self.lights_uniform_buf, 0,
             bytemuck::bytes_of(&LightArrayUniform::from_scene(scene)));
+        self.queue.write_buffer(&self.env_uniform_buf, 0,
+            bytemuck::bytes_of(&EnvUniform::from_yaw(self.env_rotation_yaw)));
 
         let sun_dir = scene.lights.iter()
             .find(|l| l.enabled && matches!(l.kind, LightKind::Directional))
             .map(|l| l.position_or_direction.normalize())
             .unwrap_or(Vec3::new(0.4, 0.8, 0.3).normalize());
 
-        let light_vp = ShadowRenderer::compute_light_matrix(sun_dir, Vec3::ZERO, 8.0);
+        // Rotate sun to stay consistent with env rotation
+        let yaw = self.env_rotation_yaw;
+        let (s, c) = yaw.sin_cos();
+        let rotated_sun = Vec3::new(
+            sun_dir.x * c + sun_dir.z * s,
+            sun_dir.y,
+            -sun_dir.x * s + sun_dir.z * c,
+        );
+
+        let light_vp = ShadowRenderer::compute_light_matrix(rotated_sun, Vec3::ZERO, 8.0);
         self.shadow.update(&self.queue, light_vp);
-        self.sky_uniform.sun_direction = [sun_dir.x, sun_dir.y, sun_dir.z, 0.0];
+        self.sky_uniform.sun_direction = [rotated_sun.x, rotated_sun.y, rotated_sun.z, 0.0];
         self.skybox.update(&self.queue, &self.sky_uniform);
 
         for (i, obj) in scene.objects.iter().enumerate() {

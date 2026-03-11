@@ -49,19 +49,22 @@ impl Camera {
 }
 
 #[derive(PartialEq)]
-enum DragMode { None, Orbit, Pan }
+enum DragMode { None, Orbit, Pan, EnvRotate }
 
 /// Orbital camera — Blender/Maya style:
-///   LMB drag     → orbit around target
-///   MMB drag     → pan
-///   Scroll       → dolly zoom
-///   Numpad 1/3/7 → front/right/top view
-///   F            → reset to origin
+///   LMB drag          → orbit around target
+///   Shift + LMB drag  → rotate environment (like Substance Painter)
+///   MMB drag          → pan
+///   Scroll            → dolly zoom
+///   Numpad 1/3/7      → front/right/top view
+///   F                 → reset to origin
 pub struct CameraController {
     pub radius: f32,
     pub yaw:    f32,
     pub pitch:  f32,
+    pub env_rotation_yaw: f32,
     drag_mode:    DragMode,
+    shift_held:   bool,
     last_x:       f64,
     last_y:       f64,
     pending_dx:   f64,
@@ -70,16 +73,20 @@ pub struct CameraController {
     orbit_speed:  f32,
     pan_speed:    f32,
     zoom_speed:   f32,
+    env_rot_speed: f32,
 }
 
 impl CameraController {
     pub fn new(distance: f32, yaw: f32, pitch: f32) -> Self {
         Self {
             radius: distance, yaw, pitch,
+            env_rotation_yaw: 0.0,
             drag_mode: DragMode::None,
+            shift_held: false,
             last_x: 0.0, last_y: 0.0,
             pending_dx: 0.0, pending_dy: 0.0, pending_zoom: 0.0,
             orbit_speed: 0.005, pan_speed: 0.001, zoom_speed: 0.15,
+            env_rot_speed: 0.005,
         }
     }
 
@@ -87,8 +94,16 @@ impl CameraController {
         let pressed = *state == ElementState::Pressed;
         match button {
             MouseButton::Left => {
-                if pressed { self.drag_mode = DragMode::Orbit; }
-                else if self.drag_mode == DragMode::Orbit { self.drag_mode = DragMode::None; }
+                if pressed {
+                    // Shift+LMB → env rotate (Substance Painter style)
+                    if self.shift_held {
+                        self.drag_mode = DragMode::EnvRotate;
+                    } else {
+                        self.drag_mode = DragMode::Orbit;
+                    }
+                } else if matches!(self.drag_mode, DragMode::Orbit | DragMode::EnvRotate) {
+                    self.drag_mode = DragMode::None;
+                }
             }
             MouseButton::Middle => {
                 if pressed { self.drag_mode = DragMode::Pan; }
@@ -104,7 +119,7 @@ impl CameraController {
         self.last_x = x;
         self.last_y = y;
         match self.drag_mode {
-            DragMode::Orbit | DragMode::Pan => {
+            DragMode::Orbit | DragMode::Pan | DragMode::EnvRotate => {
                 self.pending_dx += dx;
                 self.pending_dy += dy;
             }
@@ -120,14 +135,25 @@ impl CameraController {
     }
 
     pub fn process_keyboard(&mut self, event: &KeyEvent, camera: &mut Camera) {
-        if event.state != ElementState::Pressed { return; }
+        let pressed = event.state == ElementState::Pressed;
         if let PhysicalKey::Code(code) = event.physical_key {
             match code {
+                KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                    self.shift_held = pressed;
+                    // If mid-orbit and shift pressed, switch to env rotate
+                    if pressed && self.drag_mode == DragMode::Orbit {
+                        self.drag_mode = DragMode::EnvRotate;
+                    } else if !pressed && self.drag_mode == DragMode::EnvRotate {
+                        self.drag_mode = DragMode::None;
+                    }
+                }
+                _ if !pressed => {}
                 KeyCode::Numpad1 => { self.yaw = 0.0;                         self.pitch = 0.0; camera.dirty = true; }
                 KeyCode::Numpad3 => { self.yaw = std::f32::consts::FRAC_PI_2; self.pitch = 0.0; camera.dirty = true; }
                 KeyCode::Numpad7 => { self.pitch = std::f32::consts::FRAC_PI_2 - 0.01; camera.dirty = true; }
                 KeyCode::Numpad9 => { self.pitch = -(std::f32::consts::FRAC_PI_2 - 0.01); camera.dirty = true; }
                 KeyCode::KeyF    => { camera.target = Vec3::ZERO; self.radius = 5.0; camera.dirty = true; }
+                KeyCode::KeyR    => { self.env_rotation_yaw = 0.0; } // reset env rotation
                 KeyCode::NumpadAdd      => { self.pending_zoom += 2.0; }
                 KeyCode::NumpadSubtract => { self.pending_zoom -= 2.0; }
                 _ => {}
@@ -148,6 +174,10 @@ impl CameraController {
                      std::f32::consts::FRAC_PI_2 - 0.02,
                 );
                 camera.dirty = true;
+            }
+            DragMode::EnvRotate => {
+                // Only horizontal drag affects env yaw (same as Substance Painter)
+                self.env_rotation_yaw += dx * self.env_rot_speed;
             }
             DragMode::Pan => {
                 let forward   = (camera.target - camera.position).normalize();

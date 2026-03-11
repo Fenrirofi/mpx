@@ -20,6 +20,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 slotmap = "1.0"
 wgsl-inline = { version = "0.2", optional = true }
+rand = { version = "0.8", features = ["small_rng"] }
 half = "2.7.1"
 
 [profile.dev]
