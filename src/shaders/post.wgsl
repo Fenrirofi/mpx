@@ -1,8 +1,22 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  Post-Processing Shader                                                     ║
-// ║  Pass 1 (bloom_threshold): extract bright pixels                           ║
-// ║  Pass 2 (bloom_blur):      gaussian blur                                   ║
-// ║  Pass 3 (composite):       combine HDR + bloom, tonemap, CA, vignette      ║
+// ║  post.wgsl — POPRAWIONA WERSJA                                              ║
+// ║                                                                             ║
+// ║  [4] DITHERING — triangular PDF zamiast grain                               ║
+// ║                                                                             ║
+// ║  Poprzedni grain: (noise - 0.5) * strength * 0.04                          ║
+// ║  Problem: to jest uniform dither — dodaje szum o amplitudzie strength*0.04 ║
+// ║  ale nie eliminuje color banding bo rozkład jest płaski, nie trójkątny.     ║
+// ║                                                                             ║
+// ║  Rozwiązanie: triangular PDF dither (Roberts 2016, Wolfe 2017):             ║
+// ║    noise1 = IGN(pixel, t)      — jeden hash                                 ║
+// ║    noise2 = IGN(pixel + 23.0)  — drugi hash (inny offset)                  ║
+// ║    tpdf   = noise1 - noise2    ∈ (-1, 1), rozkład trójkątny               ║
+// ║    output += tpdf * (1/255)    — amplituda = 1 LSB w 8-bit                 ║
+// ║                                                                             ║
+// ║  Rozkład trójkątny jest optymalny dla dithera kwantyzacyjnego:              ║
+// ║  eliminuje pattern quantization bez widocznego wzoru szumu.                 ║
+// ║  Amplituda 1/255 ≈ 0.00392 to dokładnie 1 krok kwantyzacji 8-bit.         ║
+// ║  Zbyt mała żeby być widoczna, wystarczająca żeby złamać banding.           ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 // ── Shared fullscreen quad ─────────────────────────────────────────────────────
@@ -51,13 +65,13 @@ fn quadratic_threshold(color: vec3<f32>, threshold: f32, knee: f32) -> vec3<f32>
 
 @fragment
 fn fs_bloom_threshold(in: PostVOut) -> @location(0) vec4<f32> {
-    let color = textureSample(t_hdr, s_nearest, in.uv).rgb;
+    let color  = textureSample(t_hdr, s_nearest, in.uv).rgb;
     let bright = quadratic_threshold(color, bloom.threshold, bloom.knee);
     return vec4<f32>(bright, 1.0);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  Pass 2 – Bloom blur (separable 13-tap Gaussian, run twice: H + V)
+//  Pass 2 – Bloom blur (separable 7-tap Gaussian, run twice: H + V)
 // ══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0) var t_bloom_src: texture_2d<f32>;
@@ -70,7 +84,6 @@ struct BlurParams {
 }
 @group(0) @binding(2) var<uniform> blur: BlurParams;
 
-// Kawase dual-filter weights (approximate Gaussian)
 const WEIGHTS: array<f32, 7> = array<f32, 7>(
     0.0625, 0.125, 0.25, 0.375, 0.25, 0.125, 0.0625
 );
@@ -81,16 +94,14 @@ fn fs_bloom_blur(in: PostVOut) -> @location(0) vec4<f32> {
     let dir = select(vec2<f32>(0.0, blur.texel_size.y),
                      vec2<f32>(blur.texel_size.x, 0.0),
                      blur.horizontal == 1u);
-
     for (var i = 0; i < 7; i++) {
-        let offset = dir * f32(i - 3);
-        result += textureSample(t_bloom_src, s_linear, in.uv + offset).rgb * WEIGHTS[i];
+        result += textureSample(t_bloom_src, s_linear, in.uv + dir * f32(i - 3)).rgb * WEIGHTS[i];
     }
     return vec4<f32>(result, 1.0);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  Pass 3 – Composite: HDR + bloom + tone map + CA + vignette + grain
+//  Pass 3 – Composite: HDR + bloom + tone map + CA + vignette + dither
 // ══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0) var t_hdr_in:   texture_2d<f32>;
@@ -104,27 +115,27 @@ struct PostParams {
     vignette_strength:   f32,
     vignette_radius:     f32,
     vignette_smoothness: f32,
-    grain_strength:      f32,
+    grain_strength:      f32,  // zachowany dla kompatybilności, nie używany bezpośrednio
     time:                f32,
     ssao_strength:       f32,
     _pad0:               f32,
     _pad1:               f32,
     _pad2:               f32,
 }
-@group(0) @binding(3) var<uniform> post:  PostParams;
-@group(0) @binding(4) var t_ssao:         texture_2d<f32>;
+@group(0) @binding(3) var<uniform> post: PostParams;
+@group(0) @binding(4) var t_ssao:        texture_2d<f32>;
 
-// ── ACES fitted (Hill/Narkowicz) ──────────────────────────────────────────────
+// ── ACES fitted (Narkowicz 2015, Hill) ────────────────────────────────────────
 fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
     let a = 2.51; let b = 0.03; let c = 2.43; let d = 0.59; let e = 0.14;
-    return clamp((x*(a*x+b))/(x*(c*x+d)+e), vec3<f32>(0.0), vec3<f32>(1.0));
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // ── Chromatic aberration (radial barrel) ──────────────────────────────────────
 fn chromatic_aberration(uv: vec2<f32>, strength: f32) -> vec3<f32> {
-    let center  = uv - 0.5;
-    let dist    = length(center);
-    let dir     = normalize(center + vec2<f32>(0.0001));
+    let center = uv - 0.5;
+    let dist   = length(center);
+    let dir    = normalize(center + vec2<f32>(0.0001));
     let r = textureSample(t_hdr_in, s_comp, uv + dir * strength * dist * 1.0).r;
     let g = textureSample(t_hdr_in, s_comp, uv                              ).g;
     let b = textureSample(t_hdr_in, s_comp, uv - dir * strength * dist * 0.7).b;
@@ -133,53 +144,93 @@ fn chromatic_aberration(uv: vec2<f32>, strength: f32) -> vec3<f32> {
 
 // ── Vignette ──────────────────────────────────────────────────────────────────
 fn vignette(uv: vec2<f32>, radius: f32, smoothness: f32) -> f32 {
-    let d = length(uv - 0.5) * 2.0;
-    return 1.0 - smoothstep(radius - smoothness, radius + smoothness, d);
+    return 1.0 - smoothstep(radius - smoothness, radius + smoothness,
+                             length(uv - 0.5) * 2.0);
 }
 
-// ── Interleaved gradient noise (Jimenez 2014) – fast film grain ───────────────
-fn igr_noise(pixel: vec2<f32>, t: f32) -> f32 {
-    let p = pixel + t * 5.588238;
+// ── Interleaved Gradient Noise (Jimenez 2014) ─────────────────────────────────
+// Szybka, dobrze rozmieszczona funkcja hash dla dithera.
+// Używamy dwóch oddzielnych hashy z różnymi offsetami do konstruowania TPDF.
+fn ign(pixel: vec2<f32>, seed: f32) -> f32 {
+    let p = pixel + seed;
     return fract(52.9829189 * fract(dot(p, vec2<f32>(0.06711056, 0.00583715))));
 }
+
+// ── [4] Triangular PDF Dither ─────────────────────────────────────────────────
+//
+// Cel: złamanie color banding w ciemnych obszarach przy kwantyzacji do 8-bit.
+//
+// Metoda: triangular probability density function (TPDF)
+//   Dwie niezależne próbki uniform[0,1] → ich różnica ma rozkład trójkątny [-1,1]
+//   Amplituda = 1/255 (jeden krok 8-bit) → kwantyzacja bez widocznego szumu
+//
+// Dlaczego TPDF a nie uniform?
+//   Uniform dither ma "DC offset" — średnia wartość szumu może być ≠ 0,
+//   co powoduje lekkie jaśnienie/ciemnienie w jednolitych gradientach.
+//   TPDF ma średnią = 0 i wariancję 1/6 (zamiast 1/12 dla uniform).
+//   Wyższa wariancja = lepsze "złamanie" progów kwantyzacji, zerowa DC = brak DC bias.
+//
+// Implementacja:
+//   n1 = IGN(pixel, t)       — hash oparty na czasie (animowany)
+//   n2 = IGN(pixel, t + 23.) — drugi hash z innym seedem (niezależny)
+//   tpdf = n1 - n2           ∈ (-1, 1), rozkład trójkątny
+//   dither = tpdf / 255.0    — amplituda = 1 LSB w 8-bit
+//
+// Aplikacja: po tone mappingu i gamma, PRZED zwrotem — dodajemy do LDR [0,1].
+// Nie wpływa na HDR values > 1.0, tylko na finalną kwantyzację.
+// ─────────────────────────────────────────────────────────────────────────────
+fn tpdf_dither(pixel: vec2<f32>, t: f32) -> vec3<f32> {
+    // Dwie niezależne próbki IGN z różnymi seedami
+    let n1 = ign(pixel, t);
+    let n2 = ign(pixel, t + 23.0); // 23.0 = arytmetycznie niezależny seed
+    // Różnica = TPDF ∈ (-1, 1)
+    let tpdf = n1 - n2;
+    // Amplituda = 1 krok 8-bit (0.00392...)
+    // Stosujemy do wszystkich kanałów RGB równo (chroma-neutral dither)
+    return vec3<f32>(tpdf) * (1.0 / 255.0);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 @fragment
 fn fs_composite(in: PostVOut) -> @location(0) vec4<f32> {
     let tex_size = vec2<f32>(textureDimensions(t_hdr_in));
     let pixel    = in.uv * tex_size;
 
-    // HDR color with chromatic aberration
+    // HDR + chromatic aberration
     var hdr = chromatic_aberration(in.uv, post.ca_strength * 0.005);
 
-    // SSAO — ciemni tylko ambient (diffuse indirect), nie emissive ani bezpośrednie światła.
-    // Wartości emissive/specular wylatują z PBR niezależnie od okluzji otoczenia.
-    // W uproszczonym pipeline aplikujemy AO przed bloomem, ale NIE na całość:
-    // odejmujemy siłę proporcjonalną do jasności, zamiast mnożyć w ciemno.
-    let ao    = textureSample(t_ssao, s_comp, in.uv).r;
-    let ao_f  = mix(1.0, ao, post.ssao_strength);
-    // Tylko przygasza jasność (nie dotyczy wartości > 1.0, czyli bloom brightów)
-    hdr      *= clamp(ao_f, 0.0, 1.0);
+    // SSAO — ściemnia ambient, nie bezpośrednie światła
+    let ao   = textureSample(t_ssao, s_comp, in.uv).r;
+    hdr     *= clamp(mix(1.0, ao, post.ssao_strength), 0.0, 1.0);
 
-    // Add bloom
-    let bloom_color = textureSample(t_bloom_in, s_comp, in.uv).rgb;
-    hdr += bloom_color * post.bloom_strength;
+    // Bloom
+    hdr += textureSample(t_bloom_in, s_comp, in.uv).rgb * post.bloom_strength;
 
     // Exposure
     hdr *= pow(2.0, post.exposure);
 
-    // ACES tone mapping
+    // ACES tone mapping (HDR → LDR)
     var ldr = aces_filmic(hdr);
 
     // Vignette
-    let vig  = vignette(in.uv, post.vignette_radius, post.vignette_smoothness);
-    ldr     *= mix(1.0 - post.vignette_strength, 1.0, vig);
+    ldr *= mix(1.0 - post.vignette_strength, 1.0,
+               vignette(in.uv, post.vignette_radius, post.vignette_smoothness));
 
-    // Film grain
-    let noise = igr_noise(pixel, post.time);
-    ldr      += (noise - 0.5) * post.grain_strength * 0.04;
-
-    // Gamma correction
+    // Gamma correction (linear → sRGB display)
     ldr = pow(max(ldr, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+
+    // [4] TPDF Dither — po gamma, przed kwantyzacją do 8-bit
+    //
+    // Kluczowe: dither stosujemy w przestrzeni gamma (sRGB), NIE liniowej.
+    // W przestrzeni liniowej ciemne wartości są bardzo małe i szum byłby
+    // zbyt duży (gamma ≈ 2.2 amplifikuje różnice w cieniach).
+    // W przestrzeni gamma 1 LSB = 1/255 jest równomiernie rozmieszczony
+    // przez cały zakres tonalny → optymalny dla eliminacji bandingu.
+    ldr += tpdf_dither(pixel, post.time);
+
+    // Clamp do [0,1] po ditherze (TPDF może wyjść poza zakres przy ±1/255)
+    ldr = clamp(ldr, vec3<f32>(0.0), vec3<f32>(1.0));
 
     return vec4<f32>(ldr, 1.0);
 }

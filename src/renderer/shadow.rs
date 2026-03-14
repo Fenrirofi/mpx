@@ -137,7 +137,7 @@ impl CsmRenderer {
         let zero_pbr = CsmPbrUniform {
             light_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); 4],
             cascade_splits:  [10.0, 50.0, 150.0, 500.0],
-            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 0.0],
+            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 1.5],
         };
         let pbr_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("csm_pbr_uniform_buf"),
@@ -253,7 +253,7 @@ impl CsmRenderer {
         let pbr = CsmPbrUniform {
             light_view_proj: std::array::from_fn(|i| matrices[i].to_cols_array_2d()),
             cascade_splits:  *splits,
-            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 0.0],
+            shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 1.5],
         };
         queue.write_buffer(&self.pbr_uniform_buf, 0, bytemuck::bytes_of(&pbr));
         self.last_pbr_uniform = pbr;

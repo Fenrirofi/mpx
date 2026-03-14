@@ -81,6 +81,10 @@ pub struct RenderContext {
     env_uniform_buf:      wgpu::Buffer,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Free functions
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn create_gbuffer_tex(device: &wgpu::Device, w: u32, h: u32, label: &str)
     -> (wgpu::Texture, wgpu::TextureView)
 {
@@ -153,7 +157,6 @@ fn create_gbuffer_pipeline(
 /// Proceduralny fallback cubemap — neutralne niebo zamiast czarnego.
 /// Górna hemisfera (+Y): chłodny błękit overcast, dolna (-Y): ciemna ziemia.
 /// Boczne ściany: gradient pionowy. Wartości w liniowym HDR (nie sRGB).
-/// Dzięki temu IBL bez pliku HDR daje sensowne oświetlenie otoczenia.
 fn create_fallback_cubemap(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView) {
     const SZ: u32 = 4;
 
@@ -185,13 +188,11 @@ fn create_fallback_cubemap(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu:
     for face in 0..6u32 {
         let mut data = Vec::with_capacity((SZ * SZ * 8) as usize);
         for row in 0..SZ {
-            // rząd 0 = dół tekstury (V=0), ale dla cubemap face +Y/−Y trzeba inaczej
-            let t = row as f32 / (SZ - 1) as f32; // 0.0 = bottom, 1.0 = top
+            let t = row as f32 / (SZ - 1) as f32;
             let color = match face {
-                2 => px(sky.0, sky.1, sky.2),       // +Y: cała sky
-                3 => px(ground.0, ground.1, ground.2), // -Y: cała ground
+                2 => px(sky.0, sky.1, sky.2),
+                3 => px(ground.0, ground.1, ground.2),
                 _ => {
-                    // Boki: gradient ground→horiz→sky
                     if t < 0.45 { lerp_px(ground, horiz, t / 0.45) }
                     else        { lerp_px(horiz,  sky,  (t - 0.45) / 0.55) }
                 }
@@ -235,6 +236,10 @@ fn create_fallback_lut(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Tex
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     (tex, view)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// impl RenderContext
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl RenderContext {
     fn build_lights_shadow_bg(
@@ -384,7 +389,6 @@ impl RenderContext {
 
     pub fn load_hdr(&mut self, path: &str) -> Result<()> {
         let maps = bake_ibl(&self.device, &self.queue, path)?;
-        // Przebuduj bind group z prawdziwymi mapami IBL (tylko raz, przy załadowaniu)
         self.lights_shadow_bg = Self::build_lights_shadow_bg(
             &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
             &maps.irradiance_view, &maps.prefilter_view, &maps.brdf_lut_view,
@@ -442,6 +446,11 @@ impl RenderContext {
 
     pub fn size(&self) -> PhysicalSize<u32> { self.size }
 
+    /// Format powierzchni — potrzebny do inicjalizacji EguiRenderer.
+    pub fn surface_format(&self) -> wgpu::TextureFormat {
+        self.config.format
+    }
+
     pub fn resize(&mut self, new_size: PhysicalSize<u32>) {
         self.size          = new_size;
         self.config.width  = new_size.width.max(1);
@@ -460,18 +469,30 @@ impl RenderContext {
         self.ssr.resize(&self.device, self.config.width, self.config.height);
     }
 
-    pub fn render(&mut self, scene: &Scene) -> Result<(), wgpu::SurfaceError> {
+    /// Odbuduj GpuObject dla jednego obiektu sceny z nowym materiałem.
+    /// Wywoływane gdy layer stack zmienia parametry materiału.
+    pub fn rebuild_object(
+        &mut self,
+        index:    usize,
+        mesh:    &crate::assets::Mesh,
+        material: &crate::assets::Material,
+    ) {
+        if index >= self.gpu_objects.len() { return; }
+        self.gpu_objects[index] = self.create_gpu_object(mesh, material);
+    }
+
+    // ── Współdzielona logika przygotowania klatki ─────────────────────────────
+
+    fn prepare_frame(&mut self, scene: &Scene) -> (glam::Mat4, glam::Mat4) {
         self.frame_time += 1.0 / 60.0;
 
-        // ── Jitter TAA — geometry dostaje jittered VP, TAA reprojekcja dostaje czyste ──
-        let (jx, jy)       = self.taa.jitter(self.config.width, self.config.height);
-        let unjittered_vp  = scene.camera.view_proj();
+        let (jx, jy)        = self.taa.jitter(self.config.width, self.config.height);
+        let unjittered_vp   = scene.camera.view_proj();
         let mut jitter_proj = scene.camera.proj();
         jitter_proj.w_axis.x += jx;
         jitter_proj.w_axis.y += jy;
         let jittered_vp = jitter_proj * scene.camera.view();
 
-        // Camera uniform: jittered VP (dla geometrii i depth)
         let cam_u = CameraUniform {
             view_proj:  jittered_vp.to_cols_array_2d(),
             view:       scene.camera.view().to_cols_array_2d(),
@@ -490,19 +511,17 @@ impl RenderContext {
             .map(|l| l.position_or_direction.normalize())
             .unwrap_or(Vec3::new(0.4, 0.8, 0.3).normalize());
 
-        let yaw = self.env_rotation_yaw;
-        let (s, c) = yaw.sin_cos();
+        let (s, c) = self.env_rotation_yaw.sin_cos();
         let rotated_sun = Vec3::new(
             sun_dir.x * c + sun_dir.z * s,
             sun_dir.y,
             -sun_dir.x * s + sun_dir.z * c,
         );
 
-        // ── CSM ───────────────────────────────────────────────────────────────
-        let near = scene.camera.near;
-        let far  = scene.camera.far;
-        let splits   = CsmRenderer::compute_cascade_splits(near, far);
-        let matrices = CsmRenderer::compute_cascade_matrices(
+        let near    = scene.camera.near;
+        let far     = scene.camera.far;
+        let splits  = CsmRenderer::compute_cascade_splits(near, far);
+        let matrices= CsmRenderer::compute_cascade_matrices(
             rotated_sun, scene.camera.view(), scene.camera.proj(), near, &splits,
         );
         self.shadow.update(&self.queue, &matrices, &splits);
@@ -524,21 +543,27 @@ impl RenderContext {
             scene.camera.proj(), scene.camera.proj().inverse(), scene.camera.view(),
             self.config.width, self.config.height);
         self.ssr.update_params(&self.queue, scene.camera.proj(), scene.camera.view());
-
-        // FIX: TAA dostaje unjittered VP — reprojekcja musi być precyzyjna
         self.taa.update_params(&self.queue, unjittered_vp);
 
         let mut pp = self.post_params; pp.time = self.frame_time;
         self.post.update_params(&self.queue, &pp);
 
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("frame") });
+        (unjittered_vp, jittered_vp)
+    }
 
-        // ── Pass 1: CSM Shadow ────────────────────────────────────────────────
+    // ── Współdzielone passy renderowania (1–8) ────────────────────────────────
+
+    fn encode_pbr_passes(
+        &self,
+        scene:        &Scene,
+        encoder:      &mut wgpu::CommandEncoder,
+        unjittered_vp: glam::Mat4,
+    ) -> Result<(wgpu::SurfaceTexture, wgpu::TextureView), wgpu::SurfaceError> {
+        // Pass 1: CSM Shadow
         for cascade in 0..NUM_CASCADES {
             let cascade_view = self.shadow.set_cascade(&self.queue, cascade);
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(&format!("shadow_cascade_{cascade}")),
+                label: Some(&format!("shadow_{cascade}")),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: cascade_view,
@@ -558,7 +583,7 @@ impl RenderContext {
             }
         }
 
-        // ── Pass 2: Skybox → HDR ──────────────────────────────────────────────
+        // Pass 2: Skybox → HDR
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sky"),
@@ -578,7 +603,7 @@ impl RenderContext {
             rp.draw(0..3, 0..1);
         }
 
-        // ── Pass 3: PBR geometry → HDR ────────────────────────────────────────
+        // Pass 3: PBR geometry → HDR
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pbr"),
@@ -606,7 +631,7 @@ impl RenderContext {
             }
         }
 
-        // ── Pass 4: GBuffer (normals + metallic/roughness) ────────────────────
+        // Pass 4: GBuffer
         {
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("gbuffer"),
@@ -639,19 +664,17 @@ impl RenderContext {
             }
         }
 
-        // ── Pass 5: SSAO ──────────────────────────────────────────────────────
-        self.ssao.render(&self.device, &mut encoder, &self.depth_view, &self.gbuffer_normals_view);
+        // Pass 5: SSAO
+        self.ssao.render(&self.device, encoder, &self.depth_view, &self.gbuffer_normals_view);
 
-        // ── Pass 6: SSR ───────────────────────────────────────────────────────
-        self.ssr.render(&self.device, &mut encoder,
+        // Pass 6: SSR
+        self.ssr.render(&self.device, encoder,
             &self.post.hdr_view, &self.depth_view,
             &self.gbuffer_normals_view, &self.gbuffer_mr_view);
 
-        // ── Pass 7: TAA ───────────────────────────────────────────────────────
-        // FIX: przekaż unjittered VP — reprojekcja musi używać czystej macierzy
-        self.taa.render(&self.device, &mut encoder, &self.post.hdr_view, &self.depth_view, unjittered_vp);
+        // Pass 7: TAA
+        self.taa.render(&self.device, encoder, &self.post.hdr_view, &self.depth_view, unjittered_vp);
 
-        // FIX: skopiuj TAA output → hdr_texture żeby post-processing go zobaczył
         encoder.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.taa.output_tex, mip_level: 0,
@@ -664,14 +687,56 @@ impl RenderContext {
             wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
         );
 
-        // ── Pass 8: Post → swapchain ──────────────────────────────────────────
+        // Pass 8: Post-processing → swapchain
         let output     = self.surface.get_current_texture()?;
         let final_view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.post.render(&self.device, &mut encoder, &final_view, &self.ssao.ao_blur_view);
+        self.post.render(&self.device, encoder, &final_view, &self.ssao.ao_blur_view);
 
-        // FIX: advance_frame dostaje unjittered VP
+        Ok((output, final_view))
+    }
+
+    // ── render() — oryginalna metoda bez egui (zachowana dla kompatybilności) ─
+
+    pub fn render(&mut self, scene: &Scene) -> Result<(), wgpu::SurfaceError> {
+        let (unjittered_vp, _) = self.prepare_frame(scene);
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("frame") });
+
+        let (output, _final_view) = self.encode_pbr_passes(scene, &mut encoder, unjittered_vp)?;
+
         self.taa.advance_frame(unjittered_vp);
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+        Ok(())
+    }
 
+    // ── render_with_egui() — render + egui pass na końcu ─────────────────────
+    /// Używaj tej metody zamiast render() gdy UI jest aktywne.
+    /// egui_renderer.begin_frame() musi być wywołane PRZED tą metodą.
+    pub fn render_with_egui(
+        &mut self,
+        scene:         &Scene,
+        egui_renderer: &mut crate::ui::egui_renderer::EguiRenderer,
+        window:        &Window,
+    ) -> Result<(), wgpu::SurfaceError> {
+        let (unjittered_vp, _) = self.prepare_frame(scene);
+
+        let mut encoder = self.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("frame_egui") });
+
+        let (output, final_view) = self.encode_pbr_passes(scene, &mut encoder, unjittered_vp)?;
+
+        // Pass 9: egui → swapchain (LoadOp::Load zachowuje wynik PBR)
+        egui_renderer.end_frame_and_render(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            window,
+            &final_view,
+        );
+
+        self.taa.advance_frame(unjittered_vp);
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
