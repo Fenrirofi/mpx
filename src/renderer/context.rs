@@ -150,30 +150,66 @@ fn create_gbuffer_pipeline(
     })
 }
 
+/// Proceduralny fallback cubemap — neutralne niebo zamiast czarnego.
+/// Górna hemisfera (+Y): chłodny błękit overcast, dolna (-Y): ciemna ziemia.
+/// Boczne ściany: gradient pionowy. Wartości w liniowym HDR (nie sRGB).
+/// Dzięki temu IBL bez pliku HDR daje sensowne oświetlenie otoczenia.
 fn create_fallback_cubemap(device: &wgpu::Device, queue: &wgpu::Queue) -> (wgpu::Texture, wgpu::TextureView) {
+    const SZ: u32 = 4;
+
+    fn f16(v: f32) -> u16 { half::f16::from_f32(v).to_bits() }
+    fn px(r: f32, g: f32, b: f32) -> [u8; 8] {
+        let h = [f16(r), f16(g), f16(b), f16(1.0)];
+        let mut out = [0u8; 8];
+        for (i, v) in h.iter().enumerate() { let b = v.to_le_bytes(); out[i*2]=b[0]; out[i*2+1]=b[1]; }
+        out
+    }
+    fn lerp_px(a: (f32,f32,f32), b: (f32,f32,f32), t: f32) -> [u8; 8] {
+        px(a.0*(1.0-t)+b.0*t, a.1*(1.0-t)+b.1*t, a.2*(1.0-t)+b.2*t)
+    }
+
+    let sky    = (0.15_f32, 0.22_f32, 0.40_f32);
+    let ground = (0.04_f32, 0.04_f32, 0.04_f32);
+    let horiz  = (0.10_f32, 0.13_f32, 0.20_f32);
+
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("fallback_cube"),
-        size:  wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
+        size:  wgpu::Extent3d { width: SZ, height: SZ, depth_or_array_layers: 6 },
         mip_level_count: 1, sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format:    wgpu::TextureFormat::Rgba16Float,
         usage:     wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let black_f16: [u16; 4] = [0, 0, 0, 0x3c00];
-    let face_data: Vec<u8> = black_f16.iter().flat_map(|v| v.to_le_bytes()).collect();
+
     for face in 0..6u32 {
+        let mut data = Vec::with_capacity((SZ * SZ * 8) as usize);
+        for row in 0..SZ {
+            // rząd 0 = dół tekstury (V=0), ale dla cubemap face +Y/−Y trzeba inaczej
+            let t = row as f32 / (SZ - 1) as f32; // 0.0 = bottom, 1.0 = top
+            let color = match face {
+                2 => px(sky.0, sky.1, sky.2),       // +Y: cała sky
+                3 => px(ground.0, ground.1, ground.2), // -Y: cała ground
+                _ => {
+                    // Boki: gradient ground→horiz→sky
+                    if t < 0.45 { lerp_px(ground, horiz, t / 0.45) }
+                    else        { lerp_px(horiz,  sky,  (t - 0.45) / 0.55) }
+                }
+            };
+            for _ in 0..SZ { data.extend_from_slice(&color); }
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex, mip_level: 0,
                 origin: wgpu::Origin3d { x: 0, y: 0, z: face },
                 aspect: wgpu::TextureAspect::All,
             },
-            &face_data,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: Some(1) },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            &data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SZ * 8), rows_per_image: Some(SZ) },
+            wgpu::Extent3d { width: SZ, height: SZ, depth_or_array_layers: 1 },
         );
     }
+
     let view = tex.create_view(&wgpu::TextureViewDescriptor {
         dimension: Some(wgpu::TextureViewDimension::Cube),
         array_layer_count: Some(6), ..Default::default()
@@ -299,8 +335,8 @@ impl RenderContext {
         let (gn_tex, gn_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_normals");
         let (gm_tex, gm_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_mr");
 
-        let (_, white_view, default_sampler) = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "white");
-        let (_, flat_normal_view, _)         = texture::create_fallback_texture(&device, &queue, [128,128,255,255], "flat_normal");
+        let (_, white_view, default_sampler) = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "white",       true);
+        let (_, flat_normal_view, _)         = texture::create_fallback_texture(&device, &queue, [128,128,255,255], "flat_normal", false);
 
         let (_fb_cube_tex, fallback_cube_view) = create_fallback_cubemap(&device, &queue);
         let (_fb_lut_tex,  fallback_lut_view)  = create_fallback_lut(&device, &queue);
@@ -348,13 +384,14 @@ impl RenderContext {
 
     pub fn load_hdr(&mut self, path: &str) -> Result<()> {
         let maps = bake_ibl(&self.device, &self.queue, path)?;
+        // Przebuduj bind group z prawdziwymi mapami IBL (tylko raz, przy załadowaniu)
         self.lights_shadow_bg = Self::build_lights_shadow_bg(
             &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
             &maps.irradiance_view, &maps.prefilter_view, &maps.brdf_lut_view,
             &maps.sampler, &maps.lut_sampler, &self.env_uniform_buf,
         );
         self.ibl = Some(maps);
-        log::info!("IBL loaded.");
+        log::info!("IBL loaded — PBR ambient/specular aktywny.");
         Ok(())
     }
 
@@ -543,21 +580,6 @@ impl RenderContext {
 
         // ── Pass 3: PBR geometry → HDR ────────────────────────────────────────
         {
-            // FIX: przebuduj lights_shadow_bg tylko raz na klatkę tu (nie w każdej pętli)
-            let lights_shadow_bg = {
-                let (irr, pre, lut, ibl_s, lut_s) = if let Some(ibl) = &self.ibl {
-                    (&ibl.irradiance_view, &ibl.prefilter_view, &ibl.brdf_lut_view, &ibl.sampler, &ibl.lut_sampler)
-                } else {
-                    (&self.fallback_cube_view, &self.fallback_cube_view, &self.fallback_lut_view,
-                     &self.fallback_sampler, &self.fallback_sampler)
-                };
-                Self::build_lights_shadow_bg(
-                    &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
-                    irr, pre, lut, ibl_s, lut_s, &self.env_uniform_buf,
-                )
-            };
-            self.lights_shadow_bg = lights_shadow_bg;
-
             let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("pbr"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {

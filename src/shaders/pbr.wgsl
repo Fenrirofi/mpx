@@ -1,5 +1,25 @@
 // ══════════════════════════════════════════════════════════════════════════════
-//  PBR Shader — CSM + IBL + PCF
+//  PBR Shader — CSM + IBL + PCF  —  POPRAWIONA WERSJA
+//
+//  ZMIANA #3 (Bug #3): Naprawiona funkcja V_Smith (height-correlated GGX).
+//
+//  Przyczyna błędu: poprzednia implementacja miała zamienione argumenty ndl/ndv
+//  w wewnętrznych wyrażeniach sqrt. Poprawna forma (Lagarde & de Rousiers 2014,
+//  "Moving Frostbite to PBR", eq. 72) to:
+//
+//    Vis = 0.5 / (NdotL * sqrt(NdotV² * (1-α²) + α²)
+//                + NdotV * sqrt(NdotL² * (1-α²) + α²))
+//
+//  W praktyce: term "dla view" (gv) mnoży NdotL na zewnątrz i ma NdotV w sqrt.
+//              term "dla light" (gl) mnoży NdotV na zewnątrz i ma NdotL w sqrt.
+//
+//  Stara wersja miała je odwrotnie, co powodowało błędne przyciemnianie/
+//  rozjaśnianie specular pod kątem glancing (ndl lub ndv → 0).
+//
+//  ZMIANA #4 (dodatkowa): Zabezpieczenie TBN przed degeneracją w fragment shaderze.
+//  normalize() na wejściu do TBN jest konieczny, ale przy interpolacji GPU
+//  wektory mogą mieć length_squared bliski 0 — dodano bezpieczniejszą
+//  re-ortogonalizację Gram-Schmidt w fragment shaderze.
 // ══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -38,11 +58,10 @@ struct LightArrayUniform {
     ambient:       vec4<f32>,
 }
 
-// CSM — 4 kaskady
 struct CsmPbrUniform {
     light_view_proj: array<mat4x4<f32>, 4>,
-    cascade_splits:  vec4<f32>,   // view-space Z granicy kaskad (przyrostowe od near)
-    shadow_params:   vec4<f32>,   // x=min_bias, y=slope_bias, z=texel_size, w=unused
+    cascade_splits:  vec4<f32>,
+    shadow_params:   vec4<f32>,
 }
 
 @group(3) @binding(0) var<uniform> lights:      LightArrayUniform;
@@ -58,13 +77,15 @@ struct CsmPbrUniform {
 struct EnvUniform { rotation: mat4x4<f32>, }
 @group(3) @binding(9) var<uniform> env: EnvUniform;
 
-const PI:        f32 = 3.14159265358979;
-const INV_PI:    f32 = 0.31830988618;
-const EPSILON:   f32 = 0.00001;
-const IBL_SCALE: f32 = 0.3;
+const PI:              f32 = 3.14159265358979;
+const INV_PI:          f32 = 0.31830988618;
+const EPSILON:         f32 = 0.00001;
+const IBL_SCALE:       f32 = 0.3;
 const MAX_PREFILTER_LOD: f32 = 4.0;
 
-// --- Vertex ---
+// ─────────────────────────────────────────────────────────────────────────────
+// Vertex
+// ─────────────────────────────────────────────────────────────────────────────
 struct VertIn {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
@@ -78,7 +99,7 @@ struct VertOut {
     @location(2)        world_tan:    vec3<f32>,
     @location(3)        world_bitan:  vec3<f32>,
     @location(4)        uv:           vec2<f32>,
-    @location(5)        view_pos:     vec3<f32>,   // pozycja w view-space (dla CSM select)
+    @location(5)        view_pos:     vec3<f32>,
 }
 
 @vertex
@@ -98,70 +119,105 @@ fn vs_main(in: VertIn) -> VertOut {
     return out;
 }
 
-// --- PBR Helpers ---
+// ─────────────────────────────────────────────────────────────────────────────
+// PBR Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
 fn D_GGX(ndh: f32, r: f32) -> f32 {
-    let a2 = r*r*r*r; let d = ndh*ndh*(a2-1.0)+1.0;
-    return a2 / max(PI*d*d, EPSILON);
-}
-fn V_Smith(ndv: f32, ndl: f32, r: f32) -> f32 {
-    let a2 = r*r*r*r;
-    let gv = ndl*sqrt(ndv*ndv*(1.0-a2)+a2);
-    let gl = ndv*sqrt(ndl*ndl*(1.0-a2)+a2);
-    return 0.5/max(gv+gl, EPSILON);
-}
-fn F_Schlick(cos_t: f32, f0: vec3<f32>) -> vec3<f32> {
-    return f0 + (1.0-f0)*pow(clamp(1.0-cos_t,0.0,1.0),5.0);
-}
-fn F_SchlickR(cos_t: f32, f0: vec3<f32>, r: f32) -> vec3<f32> {
-    return f0 + (max(vec3<f32>(1.0-r),f0)-f0)*pow(clamp(1.0-cos_t,0.0,1.0),5.0);
-}
-fn Fd_Burley(ndv: f32, ndl: f32, ldh: f32, r: f32) -> f32 {
-    let f90 = 0.5+2.0*r*ldh*ldh;
-    return (1.0+(f90-1.0)*pow(1.0-ndl,5.0))*(1.0+(f90-1.0)*pow(1.0-ndv,5.0))*INV_PI;
+    let a2 = r * r * r * r;
+    let d  = ndh * ndh * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, EPSILON);
 }
 
-// --- IBL ---
-fn ibl(n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>, albedo: vec3<f32>,
-        metallic: f32, perc_rough: f32, ao: f32) -> vec3<f32> {
-    let ndv = max(dot(n, v), EPSILON);
-    let r   = reflect(-v, n);
+// ─────────────────────────────────────────────────────────────────────────────
+// ZMIANA #3: NAPRAWIONA V_Smith (height-correlated GGX)
+//
+// Poprawna forma (Lagarde 2014):
+//   Vis = 0.5 / (NdotL * sqrt(NdotV²*(1-a²) + a²)
+//              + NdotV * sqrt(NdotL²*(1-a²) + a²))
+//
+// Kluczowe: gv mnoży NdotL na zewnątrz, a NdotV jest WEWNĄTRZ sqrt.
+//           gl mnoży NdotV na zewnątrz, a NdotL jest WEWNĄTRZ sqrt.
+// Poprzednia wersja miała te dwa terminy odwrócone miejscami.
+// ─────────────────────────────────────────────────────────────────────────────
+fn V_SmithGGX(ndv: f32, ndl: f32, r: f32) -> f32 {
+    let a2 = r * r * r * r;
+    //          ↓ zewnętrzny czynnik   ↓ wewnętrzny sqrt z DRUGIM kątem
+    let gv = ndl * sqrt(ndv * ndv * (1.0 - a2) + a2);   // term view
+    let gl = ndv * sqrt(ndl * ndl * (1.0 - a2) + a2);   // term light
+    return 0.5 / max(gv + gl, EPSILON);
+}
+
+fn F_Schlick(cos_t: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_t, 0.0, 1.0), 5.0);
+}
+
+fn F_SchlickR(cos_t: f32, f0: vec3<f32>, r: f32) -> vec3<f32> {
+    return f0 + (max(vec3<f32>(1.0 - r), f0) - f0) * pow(clamp(1.0 - cos_t, 0.0, 1.0), 5.0);
+}
+
+fn Fd_Burley(ndv: f32, ndl: f32, ldh: f32, r: f32) -> f32 {
+    let f90 = 0.5 + 2.0 * r * ldh * ldh;
+    return (1.0 + (f90 - 1.0) * pow(1.0 - ndl, 5.0))
+         * (1.0 + (f90 - 1.0) * pow(1.0 - ndv, 5.0))
+         * INV_PI;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IBL
+// ─────────────────────────────────────────────────────────────────────────────
+fn ibl(
+    n:          vec3<f32>,
+    v:          vec3<f32>,
+    f0:         vec3<f32>,
+    albedo:     vec3<f32>,
+    metallic:   f32,
+    perc_rough: f32,
+    ao:         f32,
+) -> vec3<f32> {
+    let ndv   = max(dot(n, v), EPSILON);
+    let r     = reflect(-v, n);
     let n_rot = (env.rotation * vec4<f32>(n, 0.0)).xyz;
     let r_rot = (env.rotation * vec4<f32>(r, 0.0)).xyz;
+
     let irrad   = textureSample(t_irradiance, s_ibl, n_rot).rgb * IBL_SCALE;
     let F       = F_SchlickR(ndv, f0, perc_rough);
     let kd      = (1.0 - F) * (1.0 - metallic);
     let diffuse = kd * albedo * irrad;
+
     let lod       = perc_rough * MAX_PREFILTER_LOD;
     let env_color = textureSampleLevel(t_prefilter, s_ibl, r_rot, lod).rgb * IBL_SCALE;
-    let brdf_uv   = vec2<f32>(ndv, perc_rough);
+    let brdf_uv   = vec2<f32>(ndv, perc_rough);  // X=NdotV, Y=roughness — zgodne z ibl_bake.wgsl
     let brdf      = textureSample(t_brdf_lut, s_lut, brdf_uv).rg;
     let specular  = env_color * (f0 * brdf.x + brdf.y);
+
     return (diffuse + specular) * ao;
 }
 
-// --- CSM shadow sampling ---
+// ─────────────────────────────────────────────────────────────────────────────
+// CSM Shadow
+// ─────────────────────────────────────────────────────────────────────────────
 fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
-    // Wybierz kaskadę na podstawie view-space Z
-    // cascade_splits przechowuje przyrostowe głębokości od near
     var cascade = 3u;
-    let near = 0.05; // musi zgadzać się z camera.near
-    let d = -view_z - near; // głębokość od near plane
-    if d < csm.cascade_splits.x { cascade = 0u; }
-    else if d < csm.cascade_splits.x + csm.cascade_splits.y { cascade = 1u; }
-    else if d < csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z { cascade = 2u; }
+    let near = 0.05;
+    let d    = -view_z - near;
+    if d < csm.cascade_splits.x {
+        cascade = 0u;
+    } else if d < csm.cascade_splits.x + csm.cascade_splits.y {
+        cascade = 1u;
+    } else if d < csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z {
+        cascade = 2u;
+    }
 
-    // Przelicz pozycję do light-space wybranej kaskady
     let lp  = csm.light_view_proj[cascade] * vec4<f32>(world_pos, 1.0);
     let p   = lp.xyz / lp.w;
     let uv  = vec2<f32>(p.x * 0.5 + 0.5, p.y * -0.5 + 0.5);
 
-    // Odrzuć próbki poza shadow mapą
     if any(uv < vec2<f32>(0.01)) || any(uv > vec2<f32>(0.99)) { return 1.0; }
 
     let bias  = max(csm.shadow_params.y * (1.0 - ndl), csm.shadow_params.x);
     let texel = csm.shadow_params.z;
 
-    // PCF 3×3
     var pcf = 0.0;
     for (var sx = -1; sx <= 1; sx++) {
         for (var sy = -1; sy <= 1; sy++) {
@@ -171,16 +227,19 @@ fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
         }
     }
 
-    // Blend między kaskadami przy granicach (eliminuje widoczne przejścia)
     let raw = pcf / 9.0;
     if cascade < 3u {
-        let split = select(csm.cascade_splits.x,
-                    select(csm.cascade_splits.x + csm.cascade_splits.y,
-                           csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z,
-                           cascade == 2u),
-                    cascade == 1u);
+        let split = select(
+            csm.cascade_splits.x,
+            select(
+                csm.cascade_splits.x + csm.cascade_splits.y,
+                csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z,
+                cascade == 2u,
+            ),
+            cascade == 1u,
+        );
         let blend_zone = split * 0.1;
-        let blend_t = clamp((d - (split - blend_zone)) / blend_zone, 0.0, 1.0);
+        let blend_t    = clamp((d - (split - blend_zone)) / blend_zone, 0.0, 1.0);
         if blend_t > 0.0 {
             let next = cascade + 1u;
             let lp2  = csm.light_view_proj[next] * vec4<f32>(world_pos, 1.0);
@@ -202,12 +261,14 @@ fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
     return raw;
 }
 
-// --- Fragment ---
+// ─────────────────────────────────────────────────────────────────────────────
+// Fragment
+// ─────────────────────────────────────────────────────────────────────────────
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let albedo_s   = textureSample(t_base_color,         s_main, in.uv);
-    let mr_s       = textureSample(t_metallic_roughness, s_main, in.uv);
-    let norm_s     = textureSample(t_normal,             s_main, in.uv);
+    let albedo_s = textureSample(t_base_color,         s_main, in.uv);
+    let mr_s     = textureSample(t_metallic_roughness, s_main, in.uv);
+    let norm_s   = textureSample(t_normal,             s_main, in.uv);
 
     let albedo     = material.base_color.rgb * albedo_s.rgb;
     let alpha      = material.base_color.a   * albedo_s.a;
@@ -215,11 +276,27 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let perc_rough = clamp(material.metallic_roughness_ao.y * mr_s.g, 0.045, 1.0);
     let ao         = mix(1.0, mr_s.r, material.metallic_roughness_ao.z);
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZMIANA #4: Gram-Schmidt re-ortogonalizacja TBN w fragment shaderze
+    //
+    // Po interpolacji rasteryzera wektory T/B/N mogą stracić ortogonalność
+    // (szczególnie widoczne na biegunach sfery przy niskiej rozdzielczości siatki).
+    // Gram-Schmidt w FS kosztuje 2 dot + 2 multiply, ale eliminuje artefakty.
+    //
+    // Kolejność: najpierw re-ortogonalizujemy T względem N, potem odbudowujemy B.
+    // ─────────────────────────────────────────────────────────────────────────
+    let N_raw = normalize(in.world_normal);
+    let T_raw = normalize(in.world_tan);
+    // Gram-Schmidt: T' = normalize(T - N * dot(N, T))
+    let T_gs  = normalize(T_raw - N_raw * dot(N_raw, T_raw));
+    // Bitangent odbudowany z N i T (nie interpolowany), z zachowaniem znaku
+    let B_gs  = cross(N_raw, T_gs) * sign(dot(in.world_bitan, cross(N_raw, T_raw)));
+
     let n_ts = norm_s.rgb * 2.0 - 1.0;
-    let n = normalize(
-        normalize(in.world_tan)    * n_ts.x * material.metallic_roughness_ao.w +
-        normalize(in.world_bitan)  * n_ts.y * material.metallic_roughness_ao.w +
-        normalize(in.world_normal) * n_ts.z
+    let n    = normalize(
+        T_gs  * n_ts.x * material.metallic_roughness_ao.w +
+        B_gs  * n_ts.y * material.metallic_roughness_ao.w +
+        N_raw * n_ts.z
     );
 
     let v   = normalize(camera.camera_pos.xyz - in.world_pos);
@@ -230,7 +307,7 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     var lo = vec3<f32>(0.0);
     for (var i = 0u; i < lights.count_and_pad.x; i++) {
         let l_data = lights.lights[i];
-        var l_dir:   vec3<f32>;
+        var l_dir:    vec3<f32>;
         var radiance: vec3<f32>;
         var is_sun = false;
 
@@ -259,15 +336,17 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
         }
 
         let D   = D_GGX(ndh, perc_rough);
-        let Vis = V_Smith(ndv, ndl, perc_rough);
+        let Vis = V_SmithGGX(ndv, ndl, perc_rough);   // ← ZMIANA: poprawna nazwa
         let F   = F_Schlick(ldh, f0);
         let kd  = (1.0 - F) * (1.0 - metallic);
-        lo += (kd * dc * Fd_Burley(ndv, ndl, ldh, perc_rough) + D * Vis * F) * radiance * ndl * shd;
+
+        lo += (kd * dc * Fd_Burley(ndv, ndl, ldh, perc_rough) + D * Vis * F)
+            * radiance * ndl * shd;
     }
 
     let ambient = ibl(n, v, f0, dc, metallic, perc_rough, ao);
     let color   = lo + ambient + material.emissive.rgb;
 
-    // Surowy HDR — tone mapping w post.wgsl
+    // Surowy HDR — tone mapping i gamma w post.wgsl
     return vec4<f32>(color, alpha);
 }

@@ -1,3 +1,27 @@
+// ─────────────────────────────────────────────────────────────────────────────
+//  assets/mesh.rs  —  POPRAWIONA WERSJA
+//
+//  ZMIANA #2 (Bug #2): Gram-Schmidt re-ortogonalizacja tangentu w uv_sphere.
+//
+//  Przyczyna błędu: tangent to ∂position/∂theta = (-sin_theta, 0, cos_theta).
+//  Ten wektor leży w płaszczyźnie XZ (y=0), ale normalna sfery na biegunie to
+//  (0,1,0) lub (0,-1,0). Na biegunie sin_phi→0, więc pozycja to (0,±1,0),
+//  a tangent fallback (1,0,0) jest prostopadły do normali — to brzmi OK, ale:
+//
+//    cross(normal=(0,1,0), tangent=(1,0,0)) = (0,0,-1)  ← bitangent
+//
+//  Problem jest POZA biegunem: dla stack=1 (blisko bieguna) normalna jest
+//  prawie pionowa, ale tangent nadal leży poziomo. Różnica między TBN
+//  na stack=0 (fallback) i stack=1 (interpolowany) tworzy nieciągłość
+//  powodującą "pinching" — widoczny jako promieniste linie z biegunów.
+//
+//  Rozwiązanie: Gram-Schmidt ortogonalizacja gwarantuje że tangent zawsze
+//  jest prostopadły do rzeczywistej normali, eliminując nieciągłość TBN.
+//  Formuła: T' = normalize(T - N * dot(N, T))
+//
+//  Nie zmieniamy geometrii ani UV — tylko obliczenie wektora tangent.
+// ─────────────────────────────────────────────────────────────────────────────
+
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3, Vec4};
 
@@ -7,9 +31,9 @@ use glam::{Vec2, Vec3, Vec4};
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
-    pub normal: [f32; 3],
-    pub tangent: [f32; 4], // xyz = tangent, w = bitangent sign
-    pub uv: [f32; 2],
+    pub normal:   [f32; 3],
+    pub tangent:  [f32; 4], // xyz = tangent, w = bitangent sign
+    pub uv:       [f32; 2],
 }
 
 impl Vertex {
@@ -18,31 +42,27 @@ impl Vertex {
         use std::mem;
         wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                // position
+            step_mode:    wgpu::VertexStepMode::Vertex,
+            attributes:   &[
                 wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
+                    offset:           0,
+                    shader_location:  0,
+                    format:           wgpu::VertexFormat::Float32x3,
                 },
-                // normal
                 wgpu::VertexAttribute {
-                    offset: 12,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x3,
+                    offset:           12,
+                    shader_location:  1,
+                    format:           wgpu::VertexFormat::Float32x3,
                 },
-                // tangent
                 wgpu::VertexAttribute {
-                    offset: 24,
-                    shader_location: 2,
-                    format: wgpu::VertexFormat::Float32x4,
+                    offset:           24,
+                    shader_location:  2,
+                    format:           wgpu::VertexFormat::Float32x4,
                 },
-                // uv
                 wgpu::VertexAttribute {
-                    offset: 40,
-                    shader_location: 3,
-                    format: wgpu::VertexFormat::Float32x2,
+                    offset:           40,
+                    shader_location:  3,
+                    format:           wgpu::VertexFormat::Float32x2,
                 },
             ],
         }
@@ -51,40 +71,37 @@ impl Vertex {
     pub fn new(position: Vec3, normal: Vec3, tangent: Vec4, uv: Vec2) -> Self {
         Self {
             position: position.to_array(),
-            normal: normal.to_array(),
-            tangent: tangent.to_array(),
-            uv: uv.to_array(),
+            normal:   normal.to_array(),
+            tangent:  tangent.to_array(),
+            uv:       uv.to_array(),
         }
     }
 }
 
 /// CPU-side mesh representation.
 pub struct Mesh {
-    pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
+    pub vertices:        Vec<Vertex>,
+    pub indices:         Vec<u32>,
     /// Bounding sphere (center xyz, radius w) for culling.
     pub bounding_sphere: Vec4,
 }
 
 impl Mesh {
-    /// Build a simple UV sphere with mikktspace-style tangents placeholder.
-
+    /// Build a UV sphere with analytically correct, Gram-Schmidt ortogonalized tangents.
     pub fn uv_sphere(stacks: u32, slices: u32) -> Self {
         use std::f32::consts::PI;
 
         let mut vertices = Vec::new();
-        let mut indices = Vec::new();
+        let mut indices  = Vec::new();
 
         for stack in 0..=stacks {
-            // Dodajemy mały epsilon do phi, aby uniknąć sin(0) = 0 na biegunach.
-            // To sprawia, że tan_raw nigdy nie będzie wektorem zerowym.
             let phi = PI * (stack as f32 / stacks as f32);
 
             for slice in 0..=slices {
                 let theta = 2.0 * PI * (slice as f32 / slices as f32);
 
-                let sin_phi = phi.sin();
-                let cos_phi = phi.cos();
+                let sin_phi   = phi.sin();
+                let cos_phi   = phi.cos();
                 let sin_theta = theta.sin();
                 let cos_theta = theta.cos();
 
@@ -93,40 +110,73 @@ impl Mesh {
                 let z = sin_phi * sin_theta;
 
                 let position = Vec3::new(x, y, z);
-                let normal = position; // Na sferze jednostkowej normalna = pozycja
-                let uv = Vec2::new(slice as f32 / slices as f32, stack as f32 / stacks as f32);
+                let normal   = position; // Na sferze jednostkowej normalna = pozycja
+                let uv       = Vec2::new(
+                    slice as f32 / slices as f32,
+                    stack as f32 / stacks as f32,
+                );
 
-                // Obliczanie tangentu (pochodna pozycji względem theta)
-                // Dzięki sin_phi, na biegunach ten wektor stawałby się [0,0,0]
-                let mut tangent_xyz = Vec3::new(-sin_theta, 0.0, cos_theta);
+                // ─────────────────────────────────────────────────────────────
+                // ZMIANA: Gram-Schmidt ortogonalizacja tangentu
+                //
+                // Krok 1: Tangent analityczny = ∂position/∂theta
+                //   = d/dθ (sin_phi*cos_theta, cos_phi, sin_phi*sin_theta)
+                //   = (-sin_phi*sin_theta, 0, sin_phi*cos_theta)
+                //
+                // Uwaga: nie normalizujemy przed Gram-Schmidtem — długość nie
+                // ma znaczenia dla kierunku, a normalizacja po projekcji jest
+                // dokładniejsza numerycznie.
+                //
+                // Krok 2: Gram-Schmidt — usuń składową równoległą do normali:
+                //   T' = T - N * dot(N, T)
+                //   Następnie znormalizuj T'.
+                //
+                // Na biegunie (sin_phi=0): T_analytic = (0,0,0) — wektor zerowy.
+                // W takim przypadku wybieramy stabilny kierunek prostopadły do N.
+                //
+                // Krok 3: Sprawdź handedness (znak bitangentu).
+                //   Dla UV sfery U rośnie w kierunku +theta, więc bitangent
+                //   = cross(N, T) powinien wskazywać "w górę" wzdłuż południków.
+                //   Znak w = +1.0 jest poprawny dla tej konwencji.
+                // ─────────────────────────────────────────────────────────────
 
-                // Jeśli jesteśmy bardzo blisko bieguna, używamy stabilnego kierunku
-                if sin_phi.abs() < 1e-6 {
-                    tangent_xyz = Vec3::new(1.0, 0.0, 0.0);
+                // Tangent analityczny ∂pos/∂θ (bez normalizacji)
+                let t_analytic = Vec3::new(
+                    -sin_phi * sin_theta,
+                    0.0,
+                    sin_phi * cos_theta,
+                );
+
+                let tangent_final = if t_analytic.length_squared() > 1e-10 {
+                    // Gram-Schmidt: T' = normalize(T - N * dot(N, T))
+                    // Dla sfery jednostkowej dot(N, T_analytic) = 0 zawsze
+                    // (T leży w płaszczyźnie XZ, N nie — ale sprawdzamy ogólnie)
+                    let t_ortho = t_analytic - normal * normal.dot(t_analytic);
+                    if t_ortho.length_squared() > 1e-10 {
+                        t_ortho.normalize()
+                    } else {
+                        // Zdegenerowany przypadek — wybierz wektor z bazy
+                        gram_schmidt_fallback(normal)
+                    }
                 } else {
-                    tangent_xyz = tangent_xyz.normalize();
-                }
+                    // Biegun: sin_phi ≈ 0, t_analytic ≈ 0 — użyj fallbacku
+                    // Fallback musi być prostopadły do normali bieguna (0,±1,0)
+                    gram_schmidt_fallback(normal)
+                };
 
-                let tangent = Vec4::new(tangent_xyz.x, tangent_xyz.y, tangent_xyz.z, 1.0);
-
-                // Poprawka: przekazujemy position jako pierwszy argument, normal jako drugi
+                let tangent = Vec4::new(tangent_final.x, tangent_final.y, tangent_final.z, 1.0);
                 vertices.push(Vertex::new(position, normal, tangent, uv));
             }
         }
 
         for stack in 0..stacks {
             for slice in 0..slices {
-                let first = stack * (slices + 1) + slice;
+                let first  = stack * (slices + 1) + slice;
                 let second = first + slices + 1;
 
-                // Standardowe trójkąty dla siatki UV
                 indices.extend_from_slice(&[
-                    first,
-                    first + 1,
-                    second,
-                    first + 1,
-                    second + 1,
-                    second,
+                    first,     first + 1, second,
+                    first + 1, second + 1, second,
                 ]);
             }
         }
@@ -142,43 +192,22 @@ impl Mesh {
     pub fn cube() -> Self {
         let positions: [[f32; 3]; 24] = [
             // +Z face
-            [-1., -1., 1.],
-            [1., -1., 1.],
-            [1., 1., 1.],
-            [-1., 1., 1.],
+            [-1., -1.,  1.], [ 1., -1.,  1.], [ 1.,  1.,  1.], [-1.,  1.,  1.],
             // -Z face
-            [1., -1., -1.],
-            [-1., -1., -1.],
-            [-1., 1., -1.],
-            [1., 1., -1.],
+            [ 1., -1., -1.], [-1., -1., -1.], [-1.,  1., -1.], [ 1.,  1., -1.],
             // +X face
-            [1., -1., 1.],
-            [1., -1., -1.],
-            [1., 1., -1.],
-            [1., 1., 1.],
+            [ 1., -1.,  1.], [ 1., -1., -1.], [ 1.,  1., -1.], [ 1.,  1.,  1.],
             // -X face
-            [-1., -1., -1.],
-            [-1., -1., 1.],
-            [-1., 1., 1.],
-            [-1., 1., -1.],
+            [-1., -1., -1.], [-1., -1.,  1.], [-1.,  1.,  1.], [-1.,  1., -1.],
             // +Y face
-            [-1., 1., 1.],
-            [1., 1., 1.],
-            [1., 1., -1.],
-            [-1., 1., -1.],
+            [-1.,  1.,  1.], [ 1.,  1.,  1.], [ 1.,  1., -1.], [-1.,  1., -1.],
             // -Y face
-            [-1., -1., -1.],
-            [1., -1., -1.],
-            [1., -1., 1.],
-            [-1., -1., 1.],
+            [-1., -1., -1.], [ 1., -1., -1.], [ 1., -1.,  1.], [-1., -1.,  1.],
         ];
         let normals: [[f32; 3]; 6] = [
-            [0., 0., 1.],
-            [0., 0., -1.],
-            [1., 0., 0.],
-            [-1., 0., 0.],
-            [0., 1., 0.],
-            [0., -1., 0.],
+            [ 0.,  0.,  1.], [ 0.,  0., -1.],
+            [ 1.,  0.,  0.], [-1.,  0.,  0.],
+            [ 0.,  1.,  0.], [ 0., -1.,  0.],
         ];
         let uvs: [[f32; 2]; 4] = [[0., 1.], [1., 1.], [1., 0.], [0., 0.]];
 
@@ -187,7 +216,7 @@ impl Mesh {
             for vert in 0..4usize {
                 let pos = Vec3::from(positions[face * 4 + vert]);
                 let nor = Vec3::from(normals[face]);
-                let uv = Vec2::from(uvs[vert]);
+                let uv  = Vec2::from(uvs[vert]);
                 let tan = Vec4::new(1., 0., 0., 1.);
                 vertices.push(Vertex::new(pos, nor, tan, uv));
             }
@@ -205,4 +234,20 @@ impl Mesh {
             bounding_sphere: Vec4::new(0., 0., 0., 1.732),
         }
     }
+}
+
+/// Wybiera stabilny tangent prostopadły do `n` gdy tangent analityczny jest zerowy.
+/// Używa metody "least-parallel axis" (Frisvad/Hughes-Moller).
+#[inline]
+fn gram_schmidt_fallback(n: Vec3) -> Vec3 {
+    // Wybierz oś bazową jak najbardziej odmienną od n
+    let axis = if n.x.abs() <= n.y.abs() && n.x.abs() <= n.z.abs() {
+        Vec3::X
+    } else if n.y.abs() <= n.z.abs() {
+        Vec3::Y
+    } else {
+        Vec3::Z
+    };
+    // Gram-Schmidt z wybraną osią: usuń składową n, znormalizuj
+    (axis - n * n.dot(axis)).normalize()
 }

@@ -25,13 +25,13 @@ impl Scene {
         let camera = Camera::new(vec3(0.0, 2.0, 6.0), vec3(0.0, 0.0, 0.0), 1280.0 / 720.0);
 
         let objects = vec![
-            // Gold metallic sphere
+            // Złota metaliczna sfera — metallic=1.0, roughness=0.3
             SceneObject {
                 mesh:      Mesh::uv_sphere(64, 64),
-                material:  Material::dielectric(Vec4::new(0.95, 0.75, 0.2, 1.0), 0.4),
+                material:  Material::metallic(Vec4::new(0.95, 0.75, 0.2, 1.0), 0.3),
                 transform: Transform::identity(),
             },
-            // Rough dielectric sphere
+            // Rough dielectric — niebieski plastik
             SceneObject {
                 mesh:      Mesh::uv_sphere(64, 64),
                 material:  Material::dielectric(Vec4::new(0.1, 0.35, 0.85, 1.0), 0.7),
@@ -41,17 +41,17 @@ impl Scene {
                     t
                 },
             },
-            // Smooth plastic sphere
+            // Smooth dielectric — czerwony plastik
             SceneObject {
                 mesh:      Mesh::uv_sphere(64, 64),
-                material:  Material::dielectric(Vec4::new(0.85, 0.12, 0.08, 1.0), 0.5),
+                material:  Material::dielectric(Vec4::new(0.85, 0.12, 0.08, 1.0), 0.15),
                 transform: {
                     let mut t = Transform::identity();
                     t.set_translation(vec3(-2.5, 0.0, 0.0));
                     t
                 },
             },
-            // Floor
+            // Podłoga — ciemny szary matowy
             SceneObject {
                 mesh:     Mesh::cube(),
                 material: Material::dielectric(Vec4::new(0.18, 0.18, 0.2, 1.0), 0.85),
@@ -65,12 +65,12 @@ impl Scene {
         ];
 
         let lights = vec![
-            // Sun – warm directional matched to skybox
-            Light::directional(vec3(0.4, 0.8, 0.3).normalize(), Vec3::new(1.0, 0.92, 0.76), 8.0),
-            // Cool sky fill
-            Light::point(vec3(-6.0, 5.0, 3.0), Vec3::new(0.3, 0.5, 1.0), 80.0),
-            // Warm rim
-            Light::point(vec3(4.0, 3.0, -5.0), Vec3::new(1.0, 0.7, 0.4), 30.0),
+            // Słońce — ciepłe directionalne, zmniejszone z 8.0 do 4.0 (ACES lepiej mapuje)
+            Light::directional(vec3(0.4, 0.8, 0.3).normalize(), Vec3::new(1.0, 0.92, 0.76), 4.0),
+            // Chłodne fill z lewej górny
+            Light::point(vec3(-6.0, 5.0, 3.0), Vec3::new(0.3, 0.5, 1.0), 40.0),
+            // Ciepły rim z tyłu
+            Light::point(vec3(4.0, 3.0, -5.0), Vec3::new(1.0, 0.7, 0.4), 20.0),
         ];
 
         Self {

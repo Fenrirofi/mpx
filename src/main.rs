@@ -49,8 +49,16 @@ impl ApplicationHandler for App {
         let mut render_ctx = pollster::block_on(RenderContext::new(Arc::clone(&window)))
             .expect("renderer");
 
-        if let Err(e) = render_ctx.load_hdr("assets/ticknock_01_4k.hdr") {
-            log::warn!("HDR not loaded: {e}");  // cicho pomija błąd!
+        // Próbuj wczytać plik HDR z katalogu roboczego.
+        // Jeśli go nie ma, renderer używa proceduralnego fallback sky (neutral overcast).
+        // Aby aktywować pełne IBL: umieść plik .hdr w assets/ lub podaj inną ścieżkę.
+        match render_ctx.load_hdr("assets/ticknock_01_4k.hdr") {
+            Ok(_)  => log::info!("HDR loaded — pełne IBL aktywne."),
+            Err(e) => log::warn!(
+                "Brak pliku HDR ({e}). \
+                 Używam fallback sky cubemap (neutral overcast). \
+                 Aby uzyskać pełne IBL, umieść plik .hdr w assets/ i zaktualizuj ścieżkę."
+            ),
         }
 
         let scene      = Scene::default_scene();
