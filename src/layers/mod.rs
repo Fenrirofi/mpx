@@ -332,6 +332,8 @@ pub struct FlatMaterial {
     pub normal_scale: f32,
     pub ao_strength:  f32,
     pub emissive:     Vec3,
+    /// Zachowaj proceduralne mapy z `RenderContext` po edycji warstw.
+    pub detail_maps:  bool,
 }
 
 impl Default for FlatMaterial {
@@ -343,6 +345,7 @@ impl Default for FlatMaterial {
             normal_scale: 1.0,
             ao_strength:  1.0,
             emissive:     Vec3::ZERO,
+            detail_maps:  true,
         }
     }
 }
@@ -357,6 +360,7 @@ impl FlatMaterial {
             emissive:     self.emissive.to_array(),
             normal_scale: self.normal_scale,
             ao_strength:  self.ao_strength,
+            detail_maps:  self.detail_maps,
             ..Default::default()
         }
     }

@@ -67,9 +67,23 @@ pub struct ObjectUniform {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct MaterialUniform {
-    pub base_color:            [f32; 4],
-    pub metallic_roughness_ao: [f32; 4],
-    pub emissive:              [f32; 4],
+    pub base_color:            [f32; 4],  // offset  0
+    pub metallic_roughness_ao: [f32; 4],  // offset 16  [metallic, roughness, ao_strength, normal_scale]
+    pub emissive:              [f32; 4],  // offset 32  [r, g, b, strength]
+    // Clearcoat — [clearcoat, clearcoat_roughness, _pad, _pad]  offset 48
+    pub clearcoat_params:      [f32; 4],
+    // Sheen    — [sheen_r, sheen_g, sheen_b, sheen_roughness]   offset 64
+    pub sheen_params:          [f32; 4],
+    /// [anisotropy -1..1, aniso_rotation_rad, subsurface 0..1, parallax_height_scale 0=off]
+    pub advanced:              [f32; 4],
+    /// [ior, transmission 0..1, thickness (Beer), specular_factor KHR]
+    pub ext_ior_trans:         [f32; 4],
+    /// [specular_color RGB, _pad]
+    pub ext_specular_color:    [f32; 4],
+    /// [attenuation_color RGB (extinction), strength]
+    pub ext_attenuation:       [f32; 4],
+    /// [iridescence, film_ior, thickness_nm, _pad]
+    pub ext_iridescence:       [f32; 4],
 }
 
 pub const MAX_LIGHTS: usize = 16;
@@ -78,6 +92,7 @@ pub const MAX_LIGHTS: usize = 16;
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct GpuLight {
     pub position_or_dir: [f32; 4],
+    pub spot_dir:        [f32; 4],
     pub color_intensity: [f32; 4],
     pub params:          [f32; 4],
 }
@@ -93,6 +108,13 @@ impl GpuLight {
             LightKind::Spot { inner_angle, outer_angle } => (inner_angle, outer_angle),
             _ => (0.0, 0.0),
         };
+        let v = light.spot_direction;
+        let len = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt();
+        let (sx, sy, sz) = if len > 1e-6 {
+            (v.x / len, v.y / len, v.z / len)
+        } else {
+            (0.0_f32, -1.0_f32, 0.0_f32)
+        };
         Self {
             position_or_dir: [
                 light.position_or_direction.x,
@@ -100,6 +122,7 @@ impl GpuLight {
                 light.position_or_direction.z,
                 0.0,
             ],
+            spot_dir: [sx, sy, sz, 0.0],
             color_intensity: [light.color.x, light.color.y, light.color.z, light.intensity],
             params:          [kind_id, light.range, inner, outer],
         }

@@ -11,6 +11,7 @@ use super::{
     ibl::{bake_ibl, IblMaps},
     pipeline,
     post::{PostParams, PostProcessor},
+    procedural_textures,
     shadow::{CsmRenderer, NUM_CASCADES},
     skybox::{SkyboxRenderer, SkyUniform},
     ssao::SsaoRenderer,
@@ -56,9 +57,18 @@ pub struct RenderContext {
     gbuffer_mr_tex:  wgpu::Texture,
     gbuffer_mr_view: wgpu::TextureView,
 
-    white_view:       wgpu::TextureView,
-    flat_normal_view: wgpu::TextureView,
-    default_sampler:  wgpu::Sampler,
+    white_view:          wgpu::TextureView,
+    linear_white_view:   wgpu::TextureView,
+    flat_normal_view:    wgpu::TextureView,
+    neutral_height_view: wgpu::TextureView,
+    default_sampler:     wgpu::Sampler,
+
+    _demo_normal_tex: wgpu::Texture,
+    demo_detail_normal_view: wgpu::TextureView,
+    _demo_mr_tex: wgpu::Texture,
+    demo_detail_mr_view: wgpu::TextureView,
+    _demo_height_tex: wgpu::Texture,
+    demo_detail_height_view: wgpu::TextureView,
 
     fallback_cube_view: wgpu::TextureView,
     fallback_lut_view:  wgpu::TextureView,
@@ -340,8 +350,22 @@ impl RenderContext {
         let (gn_tex, gn_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_normals");
         let (gm_tex, gm_view) = create_gbuffer_tex(&device, config.width, config.height, "gbuf_mr");
 
-        let (_, white_view, default_sampler) = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "white",       true);
+        let (_, white_view, default_sampler) = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "white", true);
+        let (_, linear_white_view, _)        = texture::create_fallback_texture(&device, &queue, [255,255,255,255], "linear_white", false);
         let (_, flat_normal_view, _)         = texture::create_fallback_texture(&device, &queue, [128,128,255,255], "flat_normal", false);
+        let (_, neutral_height_view, _)      = texture::create_fallback_texture(&device, &queue, [128,128,128,255], "neutral_height", false);
+
+        let (n_px, mr_px, h_px) = procedural_textures::generate_demo_detail_maps();
+        let sz = procedural_textures::DEMO_MAP_SIZE;
+        let (_demo_normal_tex, demo_detail_normal_view) = texture::upload_rgba8_texture(
+            &device, &queue, sz, sz, &n_px, "demo_detail_normal", false,
+        );
+        let (_demo_mr_tex, demo_detail_mr_view) = texture::upload_rgba8_texture(
+            &device, &queue, sz, sz, &mr_px, "demo_detail_mr", false,
+        );
+        let (_demo_height_tex, demo_detail_height_view) = texture::upload_rgba8_texture(
+            &device, &queue, sz, sz, &h_px, "demo_detail_height", false,
+        );
 
         let (_fb_cube_tex, fallback_cube_view) = create_fallback_cubemap(&device, &queue);
         let (_fb_lut_tex,  fallback_lut_view)  = create_fallback_lut(&device, &queue);
@@ -373,7 +397,10 @@ impl RenderContext {
             depth_tex, depth_view,
             gbuffer_normals_tex: gn_tex, gbuffer_normals_view: gn_view,
             gbuffer_mr_tex: gm_tex, gbuffer_mr_view: gm_view,
-            white_view, flat_normal_view, default_sampler,
+            white_view, linear_white_view, flat_normal_view, neutral_height_view, default_sampler,
+            _demo_normal_tex, demo_detail_normal_view,
+            _demo_mr_tex, demo_detail_mr_view,
+            _demo_height_tex, demo_detail_height_view,
             fallback_cube_view, fallback_lut_view, fallback_sampler,
             shadow, skybox, post, ssao, taa, ssr, ibl: None,
             gpu_objects: Vec::new(),
@@ -418,20 +445,75 @@ impl RenderContext {
         let mat_u = MaterialUniform {
             base_color:            material.base_color.to_array(),
             metallic_roughness_ao: [material.metallic, material.roughness, material.ao_strength, material.normal_scale],
-            emissive:              [material.emissive[0], material.emissive[1], material.emissive[2], 0.0],
+            emissive: [
+                material.emissive[0],
+                material.emissive[1],
+                material.emissive[2],
+                material.emissive_strength,
+            ],
+            clearcoat_params:      [material.clearcoat, material.clearcoat_roughness, 0.0, 0.0],
+            sheen_params:          [material.sheen_color[0], material.sheen_color[1], material.sheen_color[2], material.sheen_roughness],
+            advanced: [
+                material.anisotropy.clamp(-1.0, 1.0),
+                material.anisotropy_rotation,
+                material.subsurface.clamp(0.0, 1.0),
+                material.height_scale.max(0.0),
+            ],
+            ext_ior_trans: [
+                material.ior.clamp(1.001, 2.8),
+                material.transmission.clamp(0.0, 1.0),
+                material.thickness.max(0.0),
+                material.specular_factor.clamp(0.0, 1.0),
+            ],
+            ext_specular_color: [
+                material.specular_color[0].max(0.0),
+                material.specular_color[1].max(0.0),
+                material.specular_color[2].max(0.0),
+                0.0,
+            ],
+            ext_attenuation: [
+                material.attenuation_color[0].max(0.0),
+                material.attenuation_color[1].max(0.0),
+                material.attenuation_color[2].max(0.0),
+                material.attenuation_strength.max(0.0),
+            ],
+            ext_iridescence: [
+                material.iridescence.clamp(0.0, 1.0),
+                material.iridescence_ior.clamp(1.0, 3.0),
+                material.iridescence_thickness_nm.max(0.0),
+                0.0,
+            ],
         };
         let material_uniform_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mat_buf"), contents: bytemuck::bytes_of(&mat_u),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+
+        let (nv, mrv, hv) = if material.detail_maps {
+            (
+                &self.demo_detail_normal_view,
+                &self.demo_detail_mr_view,
+                &self.demo_detail_height_view,
+            )
+        } else {
+            (
+                &self.flat_normal_view,
+                &self.white_view,
+                &self.neutral_height_view,
+            )
+        };
+
         let material_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("mat_bg"), layout: &self._material_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: material_uniform_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.white_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.default_sampler) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.flat_normal_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.white_view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(nv) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(mrv) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.white_view) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.linear_white_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(hv) },
             ],
         });
 

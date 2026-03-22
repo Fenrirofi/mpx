@@ -1,5 +1,5 @@
 // GBuffer — world normals + metallic/roughness dla SSAO i SSR
-// Używa tego samego material_bgl co PBR (binding 0=uniform, 4=metallic_roughness, 2=sampler)
+// Ten sam material_bgl co PBR (wszystkie bindingi + pełny MaterialUniform).
 
 struct CameraUniform {
     view_proj:  mat4x4<f32>,
@@ -15,12 +15,26 @@ struct ObjectUniform {
 }
 @group(1) @binding(0) var<uniform> object: ObjectUniform;
 
-// Dopasowane do material_bgl:
-// binding 0 = MaterialUniform (nie używamy, ale musi być w layoucie)
-struct MaterialUniform { base_color: vec4<f32>, mr_ao: vec4<f32>, emissive: vec4<f32>, }
+struct MaterialUniform {
+    base_color:            vec4<f32>,
+    metallic_roughness_ao: vec4<f32>,
+    emissive:              vec4<f32>,
+    clearcoat_params:      vec4<f32>,
+    sheen_params:          vec4<f32>,
+    advanced:              vec4<f32>,
+    ext_ior_trans:         vec4<f32>,
+    ext_specular_color:    vec4<f32>,
+    ext_attenuation:       vec4<f32>,
+    ext_iridescence:       vec4<f32>,
+}
 @group(2) @binding(0) var<uniform> _mat:              MaterialUniform;
+@group(2) @binding(1) var _t_base:                    texture_2d<f32>;
 @group(2) @binding(2) var s_main:                     sampler;
+@group(2) @binding(3) var _t_normal:                  texture_2d<f32>;
 @group(2) @binding(4) var t_metallic_roughness:       texture_2d<f32>;
+@group(2) @binding(5) var _t_emissive:                texture_2d<f32>;
+@group(2) @binding(6) var _t_occlusion:               texture_2d<f32>;
+@group(2) @binding(7) var _t_height:                  texture_2d<f32>;
 
 struct VertIn {
     @location(0) position: vec3<f32>,

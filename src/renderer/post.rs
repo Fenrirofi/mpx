@@ -14,24 +14,31 @@ pub struct PostParams {
     pub grain_strength:      f32,
     pub time:                f32,
     pub ssao_strength:       f32,
-    pub _pad0:               f32,
-    pub _pad1:               f32,
-    pub _pad2:               f32,
+    /// 1.0 = neutral; >1 zwiększa kontrast wokół środka tonalnego.
+    pub contrast:            f32,
+    /// 1.0 = neutral; 0 = skala szarości.
+    pub saturation:          f32,
+    /// Dodawane po tone map (jasniejsze cienie).
+    pub lift:                f32,
+    pub _pad_post:           f32,
 }
 
 impl Default for PostParams {
     fn default() -> Self {
         Self {
-            bloom_strength:      0.015,
-            exposure:            0.0,
-            ca_strength:         0.04,
-            vignette_strength:   0.45,
-            vignette_radius:     0.75,
-            vignette_smoothness: 0.4,
-            grain_strength:      0.02,
+            bloom_strength:      0.055,
+            exposure:            0.28,
+            ca_strength:         0.035,
+            vignette_strength:   0.38,
+            vignette_radius:     0.78,
+            vignette_smoothness: 0.42,
+            grain_strength:      0.018,
             time:                0.0,
-            ssao_strength:       0.0,
-            _pad0: 0.0, _pad1: 0.0, _pad2: 0.0,
+            ssao_strength:       0.55,
+            contrast:            1.04,
+            saturation:          1.08,
+            lift:                0.012,
+            _pad_post:           0.0,
         }
     }
 }

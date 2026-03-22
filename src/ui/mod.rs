@@ -481,6 +481,9 @@ fn post_settings(ui: &mut Ui, p: &mut PostParams) -> bool {
         dirty |= labeled_slider(ui, "Vignette",     &mut p.vignette_strength,  0.0..=1.0,  2);
         dirty |= labeled_slider(ui, "Chrom. Aber.", &mut p.ca_strength,        0.0..=1.0,  2);
         dirty |= labeled_slider(ui, "Grain",        &mut p.grain_strength,     0.0..=1.0,  2);
+        dirty |= labeled_slider(ui, "Contrast",     &mut p.contrast,           0.5..=1.8,  2);
+        dirty |= labeled_slider(ui, "Saturation",   &mut p.saturation,         0.0..=1.8,  2);
+        dirty |= labeled_slider(ui, "Lift",         &mut p.lift,               -0.1..=0.1, 3);
     });
     dirty
 }

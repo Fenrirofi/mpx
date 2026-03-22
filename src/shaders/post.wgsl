@@ -115,12 +115,13 @@ struct PostParams {
     vignette_strength:   f32,
     vignette_radius:     f32,
     vignette_smoothness: f32,
-    grain_strength:      f32,  // zachowany dla kompatybilności, nie używany bezpośrednio
+    grain_strength:      f32,
     time:                f32,
     ssao_strength:       f32,
-    _pad0:               f32,
-    _pad1:               f32,
-    _pad2:               f32,
+    contrast:            f32,
+    saturation:          f32,
+    lift:                f32,
+    _pad_post:           f32,
 }
 @group(0) @binding(3) var<uniform> post: PostParams;
 @group(0) @binding(4) var t_ssao:        texture_2d<f32>;
@@ -212,6 +213,12 @@ fn fs_composite(in: PostVOut) -> @location(0) vec4<f32> {
 
     // ACES tone mapping (HDR → LDR)
     var ldr = aces_filmic(hdr);
+
+    // Grading: kontrast wokół 0.5, saturacja, lift
+    ldr = (ldr - vec3<f32>(0.5)) * post.contrast + vec3<f32>(0.5);
+    let luma = dot(ldr, vec3<f32>(0.2126, 0.7152, 0.0722));
+    ldr = mix(vec3<f32>(luma), ldr, post.saturation);
+    ldr = ldr + vec3<f32>(post.lift);
 
     // Vignette
     ldr *= mix(1.0 - post.vignette_strength, 1.0,

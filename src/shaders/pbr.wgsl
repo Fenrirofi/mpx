@@ -26,15 +26,26 @@ struct MaterialUniform {
     base_color:            vec4<f32>,
     metallic_roughness_ao: vec4<f32>,
     emissive:              vec4<f32>,
+    clearcoat_params:      vec4<f32>,
+    sheen_params:          vec4<f32>,
+    advanced:              vec4<f32>,
+    ext_ior_trans:         vec4<f32>,
+    ext_specular_color:    vec4<f32>,
+    ext_attenuation:       vec4<f32>,
+    ext_iridescence:       vec4<f32>,
 }
 @group(2) @binding(0) var<uniform> material:         MaterialUniform;
 @group(2) @binding(1) var t_base_color:               texture_2d<f32>;
 @group(2) @binding(2) var s_main:                     sampler;
 @group(2) @binding(3) var t_normal:                   texture_2d<f32>;
 @group(2) @binding(4) var t_metallic_roughness:       texture_2d<f32>;
+@group(2) @binding(5) var t_emissive:                 texture_2d<f32>;
+@group(2) @binding(6) var t_occlusion:                texture_2d<f32>;
+@group(2) @binding(7) var t_height:                  texture_2d<f32>;
 
 struct GpuLight {
     position_or_dir: vec4<f32>,
+    spot_dir:        vec4<f32>,
     color_intensity: vec4<f32>,
     params:          vec4<f32>,
 }
@@ -67,7 +78,8 @@ struct EnvUniform { rotation: mat4x4<f32>, }
 const PI:                f32 = 3.14159265358979;
 const INV_PI:            f32 = 0.31830988618;
 const EPSILON:           f32 = 0.00001;
-const IBL_SCALE:         f32 = 0.3;
+// Pełniejsze odbicia otoczenia (viewport SP / glTF viewer ~ 1.0; było 0.3 — wyglądało „płasko”).
+const IBL_SCALE:         f32 = 1.0;
 const MAX_PREFILTER_LOD: f32 = 4.0;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,6 +190,34 @@ fn Fd_Burley(ndv: f32, ndl: f32, ldh: f32, r: f32) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CLEARCOAT & SHEEN BRDF HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Scalar Fresnel-Schlick — for clearcoat f0=0.04 (IOR=1.5).
+fn F_Schlick_f0(cos_t: f32, f0: f32) -> f32 {
+    return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_t, 0.0, 1.0), 5.0);
+}
+
+// Kelemen-Szirmay-Kalos 2001 — cheap combined visibility term for clearcoat.
+// Replaces Smith-GGX; ldh = LdotH = VdotH (half-angle cosine).
+fn V_Kelemen(ldh: f32) -> f32 {
+    return 0.25 / max(ldh * ldh, EPSILON);
+}
+
+// Charlie NDF — Estevez & Kulla 2017 ("Production Friendly Microfacet Sheen BRDF").
+// Used for fabric retro-reflection. roughness is perceptual (passed directly, not squared).
+fn D_Charlie(ndh: f32, roughness: f32) -> f32 {
+    let inv_alpha = 1.0 / max(roughness, EPSILON);
+    let sin2h     = max(1.0 - ndh * ndh, 0.0078125); // clamp: avoids pow(0, neg) in fp16
+    return (2.0 + inv_alpha) * pow(sin2h, inv_alpha * 0.5) * 0.5 * INV_PI;
+}
+
+// Ashikhmin-Premoze 2007 — visibility term paired with the Charlie NDF.
+fn V_Ashikhmin(ndv: f32, ndl: f32) -> f32 {
+    return 1.0 / max(4.0 * (ndl + ndv - ndl * ndv), EPSILON);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // IBL — [1] Specular LOD sterowany roughness
 //
 // textureSampleLevel(t_prefilter, s_ibl, r_rot, lod)
@@ -189,28 +229,89 @@ fn Fd_Burley(ndv: f32, ndl: f32, ldh: f32, r: f32) -> f32 {
 // mip levelu (cs_prefilter w ibl_bake.wgsl) — więc LOD = roughness daje
 // fizycznie poprawne rozmazanie refleksji.
 // ─────────────────────────────────────────────────────────────────────────────
+// Specular occlusion — przybliżenie Lagarde (nie świeci specular w głębokim AO).
+fn specular_occlusion(ndv: f32, ao: f32) -> f32 {
+    let a = clamp(ao, 0.0, 1.0);
+    return clamp(pow(ndv + a, 5.0) - 1.0 + a, 0.0, 1.0);
+}
+
+fn f0_from_ior(ior: f32) -> f32 {
+    let t = (ior - 1.0) / max(ior + 1.0, EPSILON);
+    return t * t;
+}
+
+fn iridescence_tint(ndv: f32, strength: f32, film_ior: f32, d_nm: f32) -> vec3<f32> {
+    if strength < 0.001 { return vec3<f32>(1.0); }
+    let opl = ndv * d_nm * 0.014 * max(film_ior, 1.0);
+    let ph = opl * 0.03141592653;
+    let r = sin(ph) * 0.5 + 0.5;
+    let g = sin(ph + 2.094395) * 0.5 + 0.5;
+    let b = sin(ph + 4.18879) * 0.5 + 0.5;
+    return mix(vec3<f32>(1.0), vec3<f32>(r, g, b), strength);
+}
+
+fn sample_transmission(n: vec3<f32>, v: vec3<f32>, ior: f32, rough: f32) -> vec3<f32> {
+    let eta = 1.0 / max(ior, 1.001);
+    let cos_i = dot(n, v);
+    let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+    var dir = reflect(-v, n);
+    if k > 0.0 {
+        dir = normalize(eta * (-v) - (eta * cos_i + sqrt(k)) * n);
+    }
+    let d_rot = (env.rotation * vec4<f32>(dir, 0.0)).xyz;
+    let lod = min(rough * MAX_PREFILTER_LOD + 2.8, MAX_PREFILTER_LOD);
+    return textureSampleLevel(t_prefilter, s_ibl, d_rot, lod).rgb * IBL_SCALE;
+}
+
 fn ibl(n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>, albedo: vec3<f32>,
-       metallic: f32, perc_rough: f32, ao: f32) -> vec3<f32> {
+       metallic: f32, perc_rough: f32, ao: f32, trans_m: f32, irid: vec3<f32>) -> vec3<f32> {
     let ndv   = max(dot(n, v), EPSILON);
     let r     = reflect(-v, n);
     let n_rot = (env.rotation * vec4<f32>(n, 0.0)).xyz;
     let r_rot = (env.rotation * vec4<f32>(r, 0.0)).xyz;
 
-    // Diffuse: irradiance cubemap × kd
     let irrad   = textureSample(t_irradiance, s_ibl, n_rot).rgb * IBL_SCALE;
     let F       = F_SchlickR(ndv, f0, perc_rough);
     let kd      = (1.0 - F) * (1.0 - metallic);
-    let diffuse = kd * albedo * irrad;
+    let en_trans = max(1.0 - trans_m, 0.0);
+    let diffuse = kd * albedo * irrad * en_trans;
 
-    // [1] Specular: prefiltered env z LOD = roughness * MAX_LOD
     let lod       = perc_rough * MAX_PREFILTER_LOD;
     let env_color = textureSampleLevel(t_prefilter, s_ibl, r_rot, lod).rgb * IBL_SCALE;
-
-    // BRDF LUT: X=NdotV, Y=roughness (zgodne z cs_brdf_lut w ibl_bake.wgsl)
-    let brdf     = textureSample(t_brdf_lut, s_lut, vec2<f32>(ndv, perc_rough)).rg;
-    let specular = env_color * (f0 * brdf.x + brdf.y);
+    let brdf      = textureSample(t_brdf_lut, s_lut, vec2<f32>(ndv, perc_rough)).rg;
+    let spec_occ  = specular_occlusion(ndv, ao);
+    let specular  = env_color * (f0 * irid * brdf.x + brdf.y) * spec_occ;
 
     return (diffuse + specular) * ao;
+}
+
+// Anizotropowy NDF (GGX) — kierunek rys w przestrzeni stycznej (T_aniso, B_aniso).
+fn D_GGX_aniso(ndh: f32, toh: f32, boh: f32, at: f32, ab: f32) -> f32 {
+    let a2 = at * ab;
+    let x  = (toh * toh) / max(at * at, EPSILON);
+    let y  = (boh * boh) / max(ab * ab, EPSILON);
+    let z  = ndh * ndh;
+    let v  = x + y + z;
+    return a2 / max(PI * v * v, EPSILON);
+}
+
+// Steep parallax mapping — spójne z height mapą 0..1 (jasny = wypukłość „wyżej” względem promienia).
+fn parallax_uv(uv: vec2<f32>, V: vec3<f32>, T: vec3<f32>, B: vec3<f32>, N: vec3<f32>, scale: f32) -> vec2<f32> {
+    if scale <= 0.00001 { return uv; }
+    let v_ts = vec3<f32>(dot(V, T), dot(V, B), dot(V, N));
+    let vz   = max(v_ts.z, 0.08);
+    let num  = 16.0;
+    let layer = 1.0 / num;
+    let delta_uv = vec2<f32>(v_ts.x, v_ts.y) / vz * scale * 0.12 / num;
+    var cur_uv = uv;
+    var cur_d  = 0.0;
+    for (var i = 0u; i < 16u; i++) {
+        let h = textureSample(t_height, s_main, cur_uv).r;
+        if cur_d >= h { break; }
+        cur_d += layer;
+        cur_uv -= delta_uv;
+    }
+    return cur_uv;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,37 +397,64 @@ fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
 // ─────────────────────────────────────────────────────────────────────────────
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let albedo_s = textureSample(t_base_color,         s_main, in.uv);
-    let mr_s     = textureSample(t_metallic_roughness, s_main, in.uv);
-    let norm_s   = textureSample(t_normal,             s_main, in.uv);
+    let N_geom = normalize(in.world_normal);
+    let T0     = normalize(in.world_tan - N_geom * dot(N_geom, in.world_tan));
+    let B0     = cross(N_geom, T0) * sign(dot(in.world_bitan, cross(N_geom, normalize(in.world_tan))));
+
+    let v = normalize(camera.camera_pos.xyz - in.world_pos);
+    let uv = parallax_uv(in.uv, v, T0, B0, N_geom, material.advanced.w);
+
+    let albedo_s = textureSample(t_base_color,         s_main, uv);
+    let mr_s     = textureSample(t_metallic_roughness, s_main, uv);
+    let norm_s   = textureSample(t_normal,             s_main, uv);
+    let occ_s    = textureSample(t_occlusion,          s_main, uv);
 
     let albedo   = material.base_color.rgb * albedo_s.rgb;
     let alpha    = material.base_color.a   * albedo_s.a;
     let metallic = clamp(material.metallic_roughness_ao.x * mr_s.b, 0.0, 1.0);
-    let ao       = mix(1.0, mr_s.r, material.metallic_roughness_ao.z);
+    let ao_mix   = material.metallic_roughness_ao.z;
+    let ao_comb  = clamp(mr_s.r * occ_s.r, 0.0, 1.0);
+    let ao       = mix(1.0, ao_comb, ao_mix);
 
-    // Raw roughness z materiału — PRZED specular AA
     let raw_roughness = clamp(material.metallic_roughness_ao.y * mr_s.g, 0.045, 1.0);
-
-    // Gram-Schmidt TBN re-ortogonalizacja (stabilność po interpolacji)
-    let N = normalize(in.world_normal);
-    let T = normalize(in.world_tan - N * dot(N, in.world_tan));
-    let B = cross(N, T) * sign(dot(in.world_bitan, cross(N, normalize(in.world_tan))));
 
     let n_ts = norm_s.rgb * 2.0 - 1.0;
     let n    = normalize(
-        T * n_ts.x * material.metallic_roughness_ao.w +
-        B * n_ts.y * material.metallic_roughness_ao.w +
-        N * n_ts.z
+        T0 * n_ts.x * material.metallic_roughness_ao.w +
+        B0 * n_ts.y * material.metallic_roughness_ao.w +
+        N_geom * n_ts.z
     );
 
-    // [1] Specular AA — zwiększ roughness na podstawie gradientu normalnej
     let perc_rough = specular_aa_roughness(n, raw_roughness);
 
-    let v   = normalize(camera.camera_pos.xyz - in.world_pos);
     let ndv = max(dot(n, v), EPSILON);
-    let f0  = mix(vec3<f32>(0.04), albedo, metallic);
+    let ior = max(material.ext_ior_trans.x, 1.001);
+    let f0d = vec3<f32>(f0_from_ior(ior)) * material.ext_specular_color.xyz * material.ext_ior_trans.w;
+    let f0  = mix(f0d, albedo, metallic);
     let dc  = albedo * (1.0 - metallic);
+    let trans_m = clamp(material.ext_ior_trans.y * (1.0 - metallic), 0.0, 1.0);
+    let diff_en = max(1.0 - trans_m, 0.0);
+    let irid = iridescence_tint(ndv, material.ext_iridescence.x,
+                                material.ext_iridescence.y, material.ext_iridescence.z);
+
+    // Anizotropia — obrót kierunku rys w płaszczyźnie stycznej (jak w SP / Filament).
+    let ani = clamp(material.advanced.x, -1.0, 1.0);
+    let rot = material.advanced.y;
+    let cr  = cos(rot);
+    let sr  = sin(rot);
+    var T_a = normalize(T0 * cr + B0 * sr);
+    T_a = normalize(T_a - n * dot(T_a, n));
+    let B_a = normalize(cross(n, T_a));
+    let at  = max(perc_rough * (1.0 + ani), 0.045);
+    let ab  = max(perc_rough * (1.0 - ani), 0.045);
+    let r_vis = sqrt(at * ab);
+
+    let clearcoat           = material.clearcoat_params.x;
+    let clearcoat_roughness = clamp(material.clearcoat_params.y, 0.045, 1.0);
+    let sheen_color         = material.sheen_params.xyz;
+    let sheen_roughness     = material.sheen_params.w;
+    let cc_perc_rough       = specular_aa_roughness(N_geom, clearcoat_roughness);
+    let subs                = clamp(material.advanced.z, 0.0, 1.0);
 
     var lo = vec3<f32>(0.0);
     for (var i = 0u; i < lights.count_and_pad.x; i++) {
@@ -335,38 +463,117 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
         var radiance: vec3<f32>;
         var is_sun   = false;
 
-        if u32(l_data.params.x) == 0u {
+        if l_data.params.x < 0.5 {
             l_dir    = normalize(-l_data.position_or_dir.xyz);
             radiance = l_data.color_intensity.rgb * l_data.color_intensity.a;
             is_sun   = true;
         } else {
-            let diff  = l_data.position_or_dir.xyz - in.world_pos;
-            let dist  = length(diff);
-            l_dir     = diff / max(dist, EPSILON);
-            radiance  = l_data.color_intensity.rgb * l_data.color_intensity.a
-                      / max(dist * dist, 0.01);
+            let Lp   = l_data.position_or_dir.xyz;
+            let to_l = Lp - in.world_pos;
+            let dist = length(to_l);
+            l_dir    = to_l / max(dist, EPSILON);
+            var base = l_data.color_intensity.rgb * l_data.color_intensity.a
+                     / max(dist * dist, 0.01);
+            let rng = l_data.params.y;
+            if rng < 900.0 && rng > 0.05 {
+                base *= pow(saturate(1.0 - dist / rng), 2.0);
+            }
+            if l_data.params.x < 1.5 {
+                radiance = base;
+            } else {
+                let spot_axis = normalize(l_data.spot_dir.xyz);
+                let cos_theta = dot(l_dir, spot_axis);
+                let cos_in = cos(l_data.params.z);
+                let cos_out = cos(l_data.params.w);
+                let spot_f = smoothstep(cos_out, cos_in, cos_theta);
+                radiance = base * spot_f;
+            }
         }
 
-        let h   = normalize(v + l_dir);
-        let ndl = max(dot(n, l_dir), 0.0);
+        let ndl_raw = dot(n, l_dir);
+        let ndl     = max(ndl_raw, 0.0);
+
+        if subs > 0.001 {
+            let back = max(dot(n, -l_dir), 0.0);
+            lo += subs * (1.0 - metallic) * dc * radiance * back * 0.22 * diff_en;
+        }
+
         if ndl <= 0.0 { continue; }
 
+        let h   = normalize(v + l_dir);
         let ndh = max(dot(n, h), EPSILON);
         let ldh = max(dot(l_dir, h), EPSILON);
 
         var shd = 1.0;
         if is_sun { shd = csm_shadow(in.world_pos, in.view_pos.z, ndl); }
 
-        let D   = D_GGX(ndh, perc_rough);
-        let Vis = V_SmithGGX_Correlated(ndv, ndl, perc_rough); // [3] NAPRAWIONA
-        let F   = F_Schlick(ldh, f0);
+        let wrap_amt = subs * 0.45;
+        let diff_wrap = mix(1.0,
+            saturate((ndl + wrap_amt) / (1.0 + wrap_amt)) / max(ndl, EPSILON),
+            subs);
+        let diff_wrap_clamped = min(diff_wrap, 2.0);
+
+        var D = 0.0;
+        if abs(ani) < 0.002 {
+            D = D_GGX(ndh, perc_rough);
+        } else {
+            let toh = dot(T_a, h);
+            let boh = dot(B_a, h);
+            D = D_GGX_aniso(ndh, toh, boh, at, ab);
+        }
+
+        let Vis = V_SmithGGX_Correlated(ndv, ndl, r_vis);
+        let F   = F_Schlick(ldh, f0) * irid;
         let kd  = (1.0 - F) * (1.0 - metallic);
 
-        lo += (kd * dc * Fd_Burley(ndv, ndl, ldh, perc_rough) + D * Vis * F)
-            * radiance * ndl * shd;
+        var cc_contrib = 0.0;
+        var Fcc        = 0.0;
+        if clearcoat > 0.001 {
+            let D_cc = D_GGX(ndh, cc_perc_rough);
+            let V_cc = V_Kelemen(ldh);
+            Fcc      = F_Schlick_f0(ldh, 0.04) * clearcoat;
+            cc_contrib = D_cc * V_cc * Fcc;
+        }
+
+        var sheen_contrib = vec3<f32>(0.0);
+        if sheen_roughness > 0.001 {
+            sheen_contrib = D_Charlie(ndh, max(sheen_roughness, 0.045))
+                          * V_Ashikhmin(ndv, ndl)
+                          * sheen_color;
+        }
+
+        let base_pbr = kd * dc * Fd_Burley(ndv, ndl, ldh, perc_rough) * diff_wrap_clamped * diff_en
+                     + D * Vis * F;
+        lo += (base_pbr * (1.0 - Fcc) + vec3<f32>(cc_contrib) + sheen_contrib) * radiance * ndl * shd;
     }
 
-    let ambient = ibl(n, v, f0, dc, metallic, perc_rough, ao);
-    // Surowy HDR — tone mapping i dithering w post.wgsl
-    return vec4<f32>(lo + ambient + material.emissive.rgb, alpha);
+    lo += lights.ambient.rgb * dc * (1.0 - metallic) * ao * INV_PI * diff_en;
+
+    var ambient = ibl(n, v, f0, dc, metallic, perc_rough, ao, trans_m, irid);
+
+    if clearcoat > 0.001 {
+        let cc_ndv   = max(dot(N_geom, v), EPSILON);
+        let Fc_ibl   = F_Schlick_f0(cc_ndv, 0.04) * clearcoat;
+        ambient      = ambient * (1.0 - Fc_ibl);
+        let r_cc_rot = (env.rotation * vec4<f32>(reflect(-v, N_geom), 0.0)).xyz;
+        let lod_cc   = cc_perc_rough * MAX_PREFILTER_LOD;
+        let env_cc   = textureSampleLevel(t_prefilter, s_ibl, r_cc_rot, lod_cc).rgb * IBL_SCALE;
+        let brdf_cc  = textureSample(t_brdf_lut, s_lut, vec2<f32>(cc_ndv, cc_perc_rough)).rg;
+        let s_occ_cc = specular_occlusion(cc_ndv, ao);
+        ambient     += env_cc * (vec3<f32>(0.04) * brdf_cc.x + brdf_cc.y) * clearcoat * s_occ_cc * irid;
+    }
+
+    let em_tex = textureSample(t_emissive, s_main, uv).rgb;
+    let em_hdr = em_tex * material.emissive.rgb * material.emissive.w;
+
+    var out_rgb = lo + ambient + em_hdr;
+    if trans_m > 0.02 {
+        var tcol = sample_transmission(n, v, ior, perc_rough);
+        let att = material.ext_attenuation.xyz * material.ext_attenuation.w
+                * max(material.ext_ior_trans.z, 0.0001);
+        tcol *= vec3<f32>(exp(-att.x), exp(-att.y), exp(-att.z));
+        out_rgb = mix(out_rgb, tcol, trans_m);
+    }
+
+    return vec4<f32>(out_rgb, alpha);
 }
