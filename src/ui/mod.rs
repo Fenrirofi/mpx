@@ -15,6 +15,7 @@ use egui::{self, Color32, RichText, Stroke, Ui};
 
 use crate::layers::{BlendMode, ChannelKind, ChannelValue, Layer, LayerStack};
 use crate::renderer::post::PostParams;
+use crate::renderer::shadow::ShadowSettings;
 use crate::scene::Scene;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -23,14 +24,15 @@ use crate::scene::Scene;
 
 pub struct UiState {
     // Layer panel
-    pub rename_index:    Option<usize>,   // który layer jest edytowany
+    pub rename_index:    Option<usize>,
     pub rename_buf:      String,
-    pub show_channels:   bool,            // rozwinięcie sekcji kanałów
+    pub show_channels:   bool,
 
     // Settings panel
     pub show_post:       bool,
     pub show_scene:      bool,
     pub show_lights:     bool,
+    pub show_shadows:    bool,
 }
 
 impl Default for UiState {
@@ -42,6 +44,7 @@ impl Default for UiState {
             show_post:     true,
             show_scene:    false,
             show_lights:   false,
+            show_shadows:  false,
         }
     }
 }
@@ -96,17 +99,18 @@ pub fn apply_dark_theme(ctx: &egui::Context) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct UiOutput {
-    pub layers_dirty:   bool,  // czy stos warstw się zmienił → odbuduj material
-    pub scene_dirty:    bool,  // czy scena się zmieniła → aktualizuj uniforms
-    pub viewport_rect:  egui::Rect, // obszar 3D viewportu (bez paneli)
+    pub layers_dirty:   bool,
+    pub scene_dirty:    bool,
+    pub viewport_rect:  egui::Rect,
 }
 
 pub fn draw(
-    ctx:        &egui::Context,
-    ui_state:   &mut UiState,
-    layers:     &mut LayerStack,
-    post_params: &mut PostParams,
-    scene:      &mut Scene,
+    ctx:             &egui::Context,
+    ui_state:        &mut UiState,
+    layers:          &mut LayerStack,
+    post_params:     &mut PostParams,
+    scene:           &mut Scene,
+    shadow_settings: &mut ShadowSettings,
 ) -> UiOutput {
     let mut layers_dirty = false;
     let mut scene_dirty  = false;
@@ -119,16 +123,12 @@ pub fn draw(
         .show(ctx, |ui| {
             ui.set_min_height(ui.available_height());
 
-            // Nagłówek panelu
             panel_header(ui, "LAYERS");
-
-            // Pasek narzędzi warstw
             layers_dirty |= layer_toolbar(ui, layers);
 
             egui::ScrollArea::vertical()
                 .id_salt("layers_scroll")
                 .show(ui, |ui| {
-                    // Lista warstw (odwrócona — góra stosu = góra UI)
                     let n = layers.layers.len();
                     let mut action: Option<LayerAction> = None;
 
@@ -144,16 +144,15 @@ pub fn draw(
                     if let Some(a) = action {
                         layers_dirty = true;
                         match a {
-                            LayerAction::Select(i) => layers.active_index = Some(i),
-                            LayerAction::Remove(i) => layers.remove(i),
-                            LayerAction::MoveUp(i) => layers.move_up(i),
-                            LayerAction::MoveDown(i)=> layers.move_down(i),
+                            LayerAction::Select(i)   => layers.active_index = Some(i),
+                            LayerAction::Remove(i)   => layers.remove(i),
+                            LayerAction::MoveUp(i)   => layers.move_up(i),
+                            LayerAction::MoveDown(i) => layers.move_down(i),
                         }
                     }
 
                     ui.add_space(8.0);
 
-                    // ── Edycja aktywnej warstwy ───────────────────────────────
                     if let Some(idx) = layers.active_index {
                         if idx < layers.layers.len() {
                             ui.separator();
@@ -176,31 +175,30 @@ pub fn draw(
             egui::ScrollArea::vertical()
                 .id_salt("settings_scroll")
                 .show(ui, |ui| {
-                    // Post-processing
                     collapsible(ui, &mut ui_state.show_post, "Post Processing", |ui| {
                         scene_dirty |= post_settings(ui, post_params);
                     });
 
-                    // Scena
                     collapsible(ui, &mut ui_state.show_scene, "Scene Objects", |ui| {
                         scene_dirty |= scene_settings(ui, scene);
                     });
 
-                    // Światła
                     collapsible(ui, &mut ui_state.show_lights, "Lights", |ui| {
                         scene_dirty |= light_settings(ui, scene);
+                    });
+
+                    collapsible(ui, &mut ui_state.show_shadows, "Shadows", |ui| {
+                        scene_dirty |= shadow_settings_ui(ui, shadow_settings);
                     });
                 });
         });
 
-    // ── Pobierz rect viewportu (środek ekranu między panelami) ───────────────
     let viewport_rect = ctx.available_rect();
-
     UiOutput { layers_dirty, scene_dirty, viewport_rect }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer toolbar — przyciski Add / Duplicate
+// Layer toolbar
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum LayerAction {
@@ -254,13 +252,11 @@ fn layer_item(
     frame.show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
-            // Widoczność
             let eye = if layer.visible { "👁" } else { "🚫" };
             if ui.small_button(eye).clicked() {
                 layer.visible = !layer.visible;
             }
 
-            // Nazwa — kliknięcie = zaznacz
             let response = ui.selectable_label(
                 is_active,
                 RichText::new(&layer.name).color(COL_TEXT).size(13.0),
@@ -269,17 +265,14 @@ fn layer_item(
             if response.double_clicked() { action = Some(LayerAction::Select(index)); }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // Usuń
                 if ui.small_button(RichText::new("✕").color(COL_DANGER)).clicked() {
                     action = Some(LayerAction::Remove(index));
                 }
-                // Przesuń
                 if ui.small_button("↑").clicked() { action = Some(LayerAction::MoveUp(index)); }
                 if ui.small_button("↓").clicked() { action = Some(LayerAction::MoveDown(index)); }
             });
         });
 
-        // Opacity mini-slider pod nazwą
         ui.horizontal(|ui| {
             ui.label(RichText::new("Opacity").color(COL_SUBTEXT).size(11.0));
             let slider = egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
@@ -289,13 +282,12 @@ fn layer_item(
         });
     });
 
-    // Cienka linia separatora
     ui.add(egui::Separator::default().spacing(0.0));
     action
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Edytor aktywnej warstwy — blend mode + kanały
+// Edytor aktywnej warstwy
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn layer_editor(ui: &mut Ui, state: &mut UiState, layer: &mut Layer) -> bool {
@@ -303,7 +295,6 @@ fn layer_editor(ui: &mut Ui, state: &mut UiState, layer: &mut Layer) -> bool {
     let pad = egui::Margin { left: 8, right: 8, top: 4, bottom: 4 };
 
     egui::Frame::none().inner_margin(pad).show(ui, |ui| {
-        // Nazwa warstwy (edytowalna)
         ui.horizontal(|ui| {
             ui.label(RichText::new("Name").color(COL_SUBTEXT).size(11.0));
             ui.text_edit_singleline(&mut layer.name);
@@ -311,7 +302,6 @@ fn layer_editor(ui: &mut Ui, state: &mut UiState, layer: &mut Layer) -> bool {
 
         ui.add_space(4.0);
 
-        // Blend Mode
         ui.horizontal(|ui| {
             ui.label(RichText::new("Blend").color(COL_SUBTEXT).size(11.0));
             egui::ComboBox::from_id_salt("blend_mode")
@@ -329,7 +319,6 @@ fn layer_editor(ui: &mut Ui, state: &mut UiState, layer: &mut Layer) -> bool {
 
         ui.add_space(6.0);
 
-        // Sekcja kanałów — toggle
         ui.horizontal(|ui| {
             let arrow = if state.show_channels { "▾" } else { "▸" };
             if ui.button(RichText::new(format!("{arrow} Channels")).size(12.0)
@@ -363,7 +352,6 @@ fn channels_editor(ui: &mut Ui, layer: &mut Layer) -> bool {
         frame.show(ui, |ui| {
             ui.set_min_width(ui.available_width());
 
-            // Nagłówek kanału z toggle
             ui.horizontal(|ui| {
                 if ui.checkbox(&mut ch.enabled, "").changed() { dirty = true; }
                 ui.label(RichText::new(ch.kind.label())
@@ -377,12 +365,10 @@ fn channels_editor(ui: &mut Ui, layer: &mut Layer) -> bool {
             ui.add_space(2.0);
 
             match ch.kind {
-                // Color pickers (Vec4)
                 ChannelKind::BaseColor | ChannelKind::Emissive => {
                     let mut color = ch.value.as_color();
                     let mut arr = [color.x, color.y, color.z];
 
-                    // Picker RGB
                     if ui.color_edit_button_rgb(&mut arr).changed() {
                         color.x = arr[0]; color.y = arr[1]; color.z = arr[2];
                         ch.value = ChannelValue::Color(color);
@@ -390,7 +376,6 @@ fn channels_editor(ui: &mut Ui, layer: &mut Layer) -> bool {
                     }
 
                     if ch.kind == ChannelKind::BaseColor {
-                        // Alpha slider dla BaseColor
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Alpha").color(COL_SUBTEXT).size(11.0));
                             if ui.add(egui::Slider::new(&mut color.w, 0.0..=1.0)
@@ -400,7 +385,6 @@ fn channels_editor(ui: &mut Ui, layer: &mut Layer) -> bool {
                             }
                         });
                     } else {
-                        // Emissive intensity (w = brightness multiplier)
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Intensity").color(COL_SUBTEXT).size(11.0));
                             let mut intensity = color.w;
@@ -414,49 +398,32 @@ fn channels_editor(ui: &mut Ui, layer: &mut Layer) -> bool {
                     }
                 }
 
-                // Scalar sliders
                 ChannelKind::Roughness => {
                     let mut v = ch.value.as_scalar();
-                    if ui.add(
-                        egui::Slider::new(&mut v, 0.0..=1.0)
-                            .fixed_decimals(3)
-                            .text("roughness")
-                    ).changed() {
-                        ch.value = ChannelValue::Scalar(v);
-                        dirty = true;
+                    if ui.add(egui::Slider::new(&mut v, 0.0..=1.0)
+                        .fixed_decimals(3).text("roughness")).changed() {
+                        ch.value = ChannelValue::Scalar(v); dirty = true;
                     }
                 }
                 ChannelKind::Metallic => {
                     let mut v = ch.value.as_scalar();
-                    if ui.add(
-                        egui::Slider::new(&mut v, 0.0..=1.0)
-                            .fixed_decimals(3)
-                            .text("metallic")
-                    ).changed() {
-                        ch.value = ChannelValue::Scalar(v);
-                        dirty = true;
+                    if ui.add(egui::Slider::new(&mut v, 0.0..=1.0)
+                        .fixed_decimals(3).text("metallic")).changed() {
+                        ch.value = ChannelValue::Scalar(v); dirty = true;
                     }
                 }
                 ChannelKind::Normal => {
                     let mut v = ch.value.as_scalar();
-                    if ui.add(
-                        egui::Slider::new(&mut v, 0.0..=2.0)
-                            .fixed_decimals(2)
-                            .text("scale")
-                    ).changed() {
-                        ch.value = ChannelValue::Scalar(v);
-                        dirty = true;
+                    if ui.add(egui::Slider::new(&mut v, 0.0..=2.0)
+                        .fixed_decimals(2).text("scale")).changed() {
+                        ch.value = ChannelValue::Scalar(v); dirty = true;
                     }
                 }
                 ChannelKind::AO => {
                     let mut v = ch.value.as_scalar();
-                    if ui.add(
-                        egui::Slider::new(&mut v, 0.0..=1.0)
-                            .fixed_decimals(3)
-                            .text("strength")
-                    ).changed() {
-                        ch.value = ChannelValue::Scalar(v);
-                        dirty = true;
+                    if ui.add(egui::Slider::new(&mut v, 0.0..=1.0)
+                        .fixed_decimals(3).text("strength")).changed() {
+                        ch.value = ChannelValue::Scalar(v); dirty = true;
                     }
                 }
             }
@@ -489,7 +456,57 @@ fn post_settings(ui: &mut Ui, p: &mut PostParams) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Scene object settings — wybór obiektu + podstawowe przesunięcie
+// Shadow settings — PCSS controls
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn shadow_settings_ui(ui: &mut Ui, s: &mut ShadowSettings) -> bool {
+    let mut dirty = false;
+    let pad = egui::Margin { left: 8, right: 8, top: 4, bottom: 4 };
+    egui::Frame::none().inner_margin(pad).show(ui, |ui| {
+        // Quality ComboBox
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [90.0, 0.0],
+                egui::Label::new(RichText::new("Quality").color(COL_SUBTEXT).size(11.0))
+            );
+            let labels = ["PCF 3×3", "PCSS 16", "PCSS 32"];
+            let mut idx = s.quality.round() as usize;
+            if idx > 2 { idx = 2; }
+            egui::ComboBox::from_id_salt("shadow_quality")
+                .selected_text(labels[idx])
+                .show_ui(ui, |ui| {
+                    for (i, label) in labels.iter().enumerate() {
+                        if ui.selectable_label(idx == i, *label).clicked() {
+                            s.quality = i as f32;
+                            dirty = true;
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(2.0);
+
+        // Light size i max penumbra — tylko gdy PCSS aktywny
+        if s.quality > 0.5 {
+            dirty |= labeled_slider(ui, "Sun size",     &mut s.light_size,        0.1..=10.0, 2);
+            dirty |= labeled_slider(ui, "Max penumbra", &mut s.max_radius_texels,  1.0..=16.0, 1);
+        }
+
+        // Info o koszcie GPU
+        ui.add_space(4.0);
+        let cost = match s.quality.round() as usize {
+            0 => "9 taps — hard shadows",
+            1 => "32 taps — soft (realtime)",
+            2 => "48 taps — soft (screenshot)",
+            _ => "",
+        };
+        ui.label(RichText::new(cost).color(COL_SUBTEXT).size(10.0));
+    });
+    dirty
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scene object settings
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn scene_settings(ui: &mut Ui, scene: &mut Scene) -> bool {
@@ -503,7 +520,6 @@ fn scene_settings(ui: &mut Ui, scene: &mut Scene) -> bool {
             )
             .default_open(i == 0)
             .show(ui, |ui| {
-                // Materiał — podstawowe kanały (dla wybranego obiektu w stack)
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Roughness").color(COL_SUBTEXT).size(11.0));
                     if ui.add(egui::Slider::new(&mut obj.material.roughness, 0.0..=1.0)
@@ -514,7 +530,6 @@ fn scene_settings(ui: &mut Ui, scene: &mut Scene) -> bool {
                     if ui.add(egui::Slider::new(&mut obj.material.metallic, 0.0..=1.0)
                                  .fixed_decimals(2)).changed() { dirty = true; }
                 });
-                // Kolor
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Color").color(COL_SUBTEXT).size(11.0));
                     let mut col = [obj.material.base_color.x, obj.material.base_color.y,

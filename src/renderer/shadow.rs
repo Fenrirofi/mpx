@@ -1,6 +1,11 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
-// ║  Cascaded Shadow Maps (CSM)                                                 ║
+// ║  Cascaded Shadow Maps (CSM) + PCSS                                          ║
 // ║  4 kaskady, każda 2048×2048 Depth32Float                                   ║
+// ║                                                                              ║
+// ║  Zmiany vs poprzednia wersja:                                               ║
+// ║  [PCSS-1] CsmPbrUniform — dodane pole shadow_ext (light_size, max_radius,  ║
+// ║           quality, _pad). shadow_params.w nadal = cascade_bias_multiplier. ║
+// ║  [PCSS-2] ShadowSettings — publiczna struct do sterowania z UI.            ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 use bytemuck::{Pod, Zeroable};
@@ -13,6 +18,39 @@ pub const SHADOW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth3
 
 const CASCADE_LAMBDA: f32 = 0.75;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// [PCSS-2] Ustawienia cieni — używane przez UI i przekazywane do update()
+// ─────────────────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowSettings {
+    /// Kątowy rozmiar źródła światła w przestrzeni world (przybliżenie).
+    /// Słońce ≈ 1.5, duże okno ≈ 5.0, mała latarnia ≈ 0.3.
+    /// Większa wartość → szerszy penumbra (miększe cienie).
+    pub light_size: f32,
+    /// Maksymalny promień kernela PCF w texelach.
+    /// Zapobiega eksplodowaniu cieni przy bardzo dużym light_size.
+    pub max_radius_texels: f32,
+    /// Jakość cieni:
+    ///   0.0 = PCF 3×3 (stały kernel, najszybszy — fallback)
+    ///   1.0 = PCSS 16 próbek (dobry do real-time)
+    ///   2.0 = PCSS 32 próbki (screenshot quality)
+    pub quality: f32,
+}
+
+impl Default for ShadowSettings {
+    fn default() -> Self {
+        Self {
+            light_size:        1.5,
+            max_radius_texels: 8.0,
+            quality:           1.0,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPU structs
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CsmUniform {
@@ -21,16 +59,30 @@ pub struct CsmUniform {
     pub _pad:            [u32; 3],
 }
 
-/// Dane wysyłane do PBR shadera (group 3 binding 1)
+/// Dane wysyłane do PBR shadera (group 3 binding 1).
+///
+/// Układ pamięci (każde pole = vec4 = 16 B, łącznie 288 B):
+///   offset   0..256 — light_view_proj [4× mat4]
+///   offset 256..272 — cascade_splits
+///   offset 272..288 — shadow_params  (x=min_bias, y=slope_bias, z=texel_size, w=cascade_bias_mult)
+///   offset 288..304 — shadow_ext     (x=light_size, y=max_radius_texels, z=quality, w=_pad)
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CsmPbrUniform {
     pub light_view_proj: [[[f32; 4]; 4]; 4],
-    /// Granice kaskad w view-space Z
+    /// Granice kaskad w view-space Z (addytywne — każda to delta od poprzedniej).
     pub cascade_splits:  [f32; 4],
-    /// x=min_bias, y=slope_bias, z=texel_size, w=unused
+    /// x=min_bias  y=slope_bias  z=texel_size  w=cascade_bias_multiplier
+    /// UWAGA: shadow_params.w = cascade_bias_multiplier — NIE usuwać!
     pub shadow_params:   [f32; 4],
+    // [PCSS-1] Nowe pole — rozszerzenie PCSS.
+    /// x=light_size_world  y=max_radius_texels  z=quality (0/1/2)  w=_pad
+    pub shadow_ext:      [f32; 4],
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CsmRenderer
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct CsmRenderer {
     pub shadow_texture:    wgpu::Texture,
@@ -44,6 +96,8 @@ pub struct CsmRenderer {
     pub pbr_uniform_buf:   wgpu::Buffer,
     pub object_bgl:        wgpu::BindGroupLayout,
     pub last_pbr_uniform:  CsmPbrUniform,
+    /// Aktualne ustawienia cieni — modyfikuj i wywołaj update() żeby zastosować.
+    pub settings:          ShadowSettings,
 }
 
 impl CsmRenderer {
@@ -51,8 +105,8 @@ impl CsmRenderer {
         let shadow_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("csm_shadow_array"),
             size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
+                width:                 SHADOW_MAP_SIZE,
+                height:                SHADOW_MAP_SIZE,
                 depth_or_array_layers: NUM_CASCADES as u32,
             },
             mip_level_count: 1,
@@ -101,7 +155,7 @@ impl CsmRenderer {
                 binding:    0,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
+                    ty:                 wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size:   None,
                 },
@@ -115,7 +169,7 @@ impl CsmRenderer {
                 binding:    0,
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
+                    ty:                 wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
                     min_binding_size:   None,
                 },
@@ -134,10 +188,13 @@ impl CsmRenderer {
             usage:    wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let settings = ShadowSettings::default();
         let zero_pbr = CsmPbrUniform {
             light_view_proj: [Mat4::IDENTITY.to_cols_array_2d(); 4],
             cascade_splits:  [10.0, 50.0, 150.0, 500.0],
             shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 1.5],
+            // [PCSS-1] Inicjalizacja shadow_ext z wartościami domyślnymi ShadowSettings.
+            shadow_ext:      [settings.light_size, settings.max_radius_texels, settings.quality, 0.0],
         };
         let pbr_uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label:    Some("csm_pbr_uniform_buf"),
@@ -200,7 +257,9 @@ impl CsmRenderer {
         Self {
             shadow_texture, shadow_array_view, cascade_views, sampler,
             pipeline, csm_uniform_buf, csm_uniform_bgl, csm_uniform_bg,
-            pbr_uniform_buf, object_bgl, last_pbr_uniform: zero_pbr,
+            pbr_uniform_buf, object_bgl,
+            last_pbr_uniform: zero_pbr,
+            settings,
         }
     }
 
@@ -248,12 +307,22 @@ impl CsmRenderer {
         })
     }
 
+    /// Aktualizuj bufor GPU danymi kaskad i aktualnymi `self.settings`.
+    /// Wywołaj każdą klatkę (lub gdy zmienią się settings).
     pub fn update(&mut self, queue: &wgpu::Queue,
                   matrices: &[Mat4; NUM_CASCADES], splits: &[f32; NUM_CASCADES]) {
         let pbr = CsmPbrUniform {
             light_view_proj: std::array::from_fn(|i| matrices[i].to_cols_array_2d()),
             cascade_splits:  *splits,
+            // shadow_params.w = 1.5 = cascade_bias_multiplier — NIE zmieniaj!
             shadow_params:   [0.001, 0.003, 1.0 / SHADOW_MAP_SIZE as f32, 1.5],
+            // [PCSS-1] Przekaż aktualne ustawienia PCSS.
+            shadow_ext: [
+                self.settings.light_size,
+                self.settings.max_radius_texels,
+                self.settings.quality,
+                0.0,
+            ],
         };
         queue.write_buffer(&self.pbr_uniform_buf, 0, bytemuck::bytes_of(&pbr));
         self.last_pbr_uniform = pbr;
@@ -275,9 +344,8 @@ impl CsmRenderer {
 }
 
 fn frustum_slice_world(inv_vp: Mat4, near: f32, far: f32, proj: Mat4) -> [Vec3; 8] {
-    // Wyciągnij near/far z macierzy proj żeby znormalizować do NDC Z
     let proj_near = -proj.w_axis.z / proj.z_axis.z;
-    let proj_far  = proj.w_axis.z / (1.0 - proj.z_axis.z);
+    let proj_far  =  proj.w_axis.z / (1.0 - proj.z_axis.z);
     let total_range = proj_far - proj_near;
 
     let ndc_near = if total_range.abs() > 0.0001 {

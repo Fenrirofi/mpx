@@ -169,6 +169,7 @@ impl ApplicationHandler for App {
                         layer_stack,
                         &mut state.render_ctx.post_params,
                         &mut state.scene,
+                        &mut state.render_ctx.shadow.settings,
                     );
 
                     // ── Aplikuj warstwy → materiał obiektu ────────────────────
