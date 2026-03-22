@@ -1,5 +1,5 @@
 // ══════════════════════════════════════════════════════════════════════════════
-//  pbr.wgsl
+//  pbr.wgsl — Kulla-Conty edition
 //
 //  Zmiany vs poprzednia wersja:
 //  [1] Specular AA  — specular_aa_roughness() via dFdx/dFdy normalnych
@@ -10,6 +10,11 @@
 //                     shadow_ext.z = 0 → PCF 3×3 (fallback)
 //                     shadow_ext.z = 1 → PCSS 16 próbek
 //                     shadow_ext.z = 2 → PCSS 32 próbek
+//  [KC] Kulla-Conty — multiscatter IBL (2017)
+//                     t_eavg_lut binding 10 — Eavg(roughness) 1D LUT
+//                     brdf.b = Ess(NdotV, roughness) z nowego cs_brdf_lut
+//                     specular = specular_ss + specular_ms
+//                     MAX_PREFILTER_LOD zaktualizowany do 8.0 (256³ × 9 mips)
 // ══════════════════════════════════════════════════════════════════════════════
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -62,30 +67,31 @@ struct LightArrayUniform {
 struct CsmPbrUniform {
     light_view_proj: array<mat4x4<f32>, 4>,
     cascade_splits:  vec4<f32>,
-    // x=min_bias  y=slope_bias  z=texel_size  w=cascade_bias_multiplier (ZACHOWAĆ!)
+    // x=min_bias  y=slope_bias  z=texel_size  w=cascade_bias_multiplier
     shadow_params:   vec4<f32>,
     // [PCSS] x=light_size  y=max_radius_texels  z=quality(0/1/2)  w=_pad
     shadow_ext:      vec4<f32>,
 }
 
-@group(3) @binding(0) var<uniform> lights:     LightArrayUniform;
-@group(3) @binding(1) var<uniform> csm:        CsmPbrUniform;
-@group(3) @binding(2) var t_shadow_map:         texture_depth_2d_array;
-@group(3) @binding(3) var s_shadow:             sampler_comparison;
-@group(3) @binding(4) var t_irradiance:         texture_cube<f32>;
-@group(3) @binding(5) var t_prefilter:          texture_cube<f32>;
-@group(3) @binding(6) var t_brdf_lut:           texture_2d<f32>;
-@group(3) @binding(7) var s_ibl:                sampler;
-@group(3) @binding(8) var s_lut:                sampler;
+@group(3) @binding(0) var<uniform> lights:      LightArrayUniform;
+@group(3) @binding(1) var<uniform> csm:         CsmPbrUniform;
+@group(3) @binding(2) var t_shadow_map:          texture_depth_2d_array;
+@group(3) @binding(3) var s_shadow:              sampler_comparison;
+@group(3) @binding(4) var t_irradiance:          texture_cube<f32>;
+@group(3) @binding(5) var t_prefilter:           texture_cube<f32>;
+@group(3) @binding(6) var t_brdf_lut:            texture_2d<f32>;
+@group(3) @binding(7) var s_ibl:                 sampler;
+@group(3) @binding(8) var s_lut:                 sampler;
 
 struct EnvUniform { rotation: mat4x4<f32>, }
-@group(3) @binding(9) var<uniform> env: EnvUniform;
+@group(3) @binding(9)  var<uniform> env:      EnvUniform;
+@group(3) @binding(10) var t_eavg_lut:        texture_2d<f32>;   // [KC] Eavg 1D LUT
 
 const PI:                f32 = 3.14159265358979;
 const INV_PI:            f32 = 0.31830988618;
 const EPSILON:           f32 = 0.00001;
 const IBL_SCALE:         f32 = 1.0;
-const MAX_PREFILTER_LOD: f32 = 4.0;
+const MAX_PREFILTER_LOD: f32 = 8.0;   // [KC] było 4.0 — teraz 256³ × 9 mips (max LOD = 8)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Vertex
@@ -123,7 +129,7 @@ fn vs_main(in: VertIn) -> VertOut {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// [1] SPECULAR ALIASING — Toksvig-style roughness adjustment
+// [1] SPECULAR ALIASING
 // ─────────────────────────────────────────────────────────────────────────────
 fn specular_aa_roughness(n: vec3<f32>, roughness: f32) -> f32 {
     let variance = length(dpdx(n)) + length(dpdy(n));
@@ -184,7 +190,7 @@ fn V_Ashikhmin(ndv: f32, ndl: f32) -> f32 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// IBL
+// IBL helpers
 // ─────────────────────────────────────────────────────────────────────────────
 fn specular_occlusion(ndv: f32, ao: f32) -> f32 {
     let a = clamp(ao, 0.0, 1.0);
@@ -199,26 +205,48 @@ fn f0_from_ior(ior: f32) -> f32 {
 fn iridescence_tint(ndv: f32, strength: f32, film_ior: f32, d_nm: f32) -> vec3<f32> {
     if strength < 0.001 { return vec3<f32>(1.0); }
     let opl = ndv * d_nm * 0.014 * max(film_ior, 1.0);
-    let ph = opl * 0.03141592653;
-    let r = sin(ph) * 0.5 + 0.5;
-    let g = sin(ph + 2.094395) * 0.5 + 0.5;
-    let b = sin(ph + 4.18879) * 0.5 + 0.5;
+    let ph  = opl * 0.03141592653;
+    let r   = sin(ph) * 0.5 + 0.5;
+    let g   = sin(ph + 2.094395) * 0.5 + 0.5;
+    let b   = sin(ph + 4.18879) * 0.5 + 0.5;
     return mix(vec3<f32>(1.0), vec3<f32>(r, g, b), strength);
 }
 
 fn sample_transmission(n: vec3<f32>, v: vec3<f32>, ior: f32, rough: f32) -> vec3<f32> {
-    let eta = 1.0 / max(ior, 1.001);
+    let eta   = 1.0 / max(ior, 1.001);
     let cos_i = dot(n, v);
-    let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
-    var dir = reflect(-v, n);
+    let k     = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+    var dir   = reflect(-v, n);
     if k > 0.0 {
         dir = normalize(eta * (-v) - (eta * cos_i + sqrt(k)) * n);
     }
     let d_rot = (env.rotation * vec4<f32>(dir, 0.0)).xyz;
-    let lod = min(rough * MAX_PREFILTER_LOD + 2.8, MAX_PREFILTER_LOD);
+    let lod   = min(rough * MAX_PREFILTER_LOD + 2.8, MAX_PREFILTER_LOD);
     return textureSampleLevel(t_prefilter, s_ibl, d_rot, lod).rgb * IBL_SCALE;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// [KC] Kulla-Conty multiscatter IBL
+//
+// Problem ze split-sum (1 bounce):
+//   Przy high roughness + metalach część energii specularu "ginie" między
+//   odbiciami mikrofacetów. Metal o roughness=1 wygląda zbyt ciemno.
+//
+// Rozwiązanie (Kulla & Conty 2017, "Revisiting Physically Based Shading"):
+//   Dodaj drugi term który kompensuje brakującą energię:
+//
+//   specular_ms = Eavg_env * (1 - Ess) / (1 - Eavg) * ms_color
+//
+//   gdzie:
+//     Ess  = directional albedo przy F0=1 (z BRDF LUT kanał B)
+//     Eavg = hemisferyczna średnia Ess (z Eavg 1D LUT)
+//     ms_color = mix(1, f0, metallic) — tint dla metali
+//     Eavg_env = env_color * (1 - Ess) — energia środowiskowa do zwrócenia
+//
+// Czemu to działa: przy roughness=1 Ess→0, ms_weight→duży →
+//   energia wraca do metalicznego specularu. Dla roughness=0 Ess→1 →
+//   ms_weight→0 → brak korekcji (idealne zwierciadło nie potrzebuje).
+// ─────────────────────────────────────────────────────────────────────────────
 fn ibl(n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>, albedo: vec3<f32>,
        metallic: f32, perc_rough: f32, ao: f32, trans_m: f32, irid: vec3<f32>) -> vec3<f32> {
     let ndv   = max(dot(n, v), EPSILON);
@@ -234,9 +262,27 @@ fn ibl(n: vec3<f32>, v: vec3<f32>, f0: vec3<f32>, albedo: vec3<f32>,
 
     let lod       = perc_rough * MAX_PREFILTER_LOD;
     let env_color = textureSampleLevel(t_prefilter, s_ibl, r_rot, lod).rgb * IBL_SCALE;
-    let brdf      = textureSample(t_brdf_lut, s_lut, vec2<f32>(ndv, perc_rough)).rg;
-    let spec_occ  = specular_occlusion(ndv, ao);
-    let specular  = env_color * (f0 * irid * brdf.x + brdf.y) * spec_occ;
+
+    // Klasyczny split-sum (1 bounce) — A = scale, B = bias
+    let brdf     = textureSample(t_brdf_lut, s_lut, vec2<f32>(ndv, perc_rough));
+    let spec_occ = specular_occlusion(ndv, ao);
+    let specular_ss = env_color * (f0 * irid * brdf.x + brdf.y) * spec_occ;
+
+    // [KC] Multiscatter term
+    let Ess  = brdf.b;   // directional albedo z nowego LUT (kanał B)
+    // Eavg: próbkujemy 1D LUT wzdłuż osi X (roughness). Oś Y = 0.5 (środek 1px).
+    let Eavg = textureSample(t_eavg_lut, s_lut, vec2<f32>(perc_rough, 0.5)).r;
+
+    // Waga multiscatter: ile brakującej energii trzeba zwrócić.
+    // Clampujemy denominator żeby uniknąć dzielenia przez 0 przy roughness≈0 (Eavg≈1).
+    let ms_denom  = max(1.0 - Eavg, EPSILON);
+    let ms_weight = (1.0 - Ess) / ms_denom;
+
+    // Kolor multiscatter: metale mają barwny F0, dielektryki białe.
+    let ms_color    = mix(vec3<f32>(1.0), f0, metallic);
+    let specular_ms = env_color * ms_weight * ms_color * (1.0 - Ess) * spec_occ;
+
+    let specular = specular_ss + specular_ms;
 
     return (diffuse + specular) * ao;
 }
@@ -276,30 +322,8 @@ fn parallax_uv(uv: vec2<f32>, V: vec3<f32>, T: vec3<f32>, B: vec3<f32>, N: vec3<
 
 // ═════════════════════════════════════════════════════════════════════════════
 // [PCSS] PERCENTAGE-CLOSER SOFT SHADOWS
-//
-// Algorytm (Fernando 2005, GPU Gems 1 Ch.11):
-//   Krok 1 — Blocker search:
-//     Próbkuj shadow mapę Poissonem w promieniu searchRadius.
-//     Oblicz avg_blocker_depth ze wszystkich próbek BLIŻEJ niż receiver.
-//
-//   Krok 2 — Penumbra estimation:
-//     penumbra = (d_receiver - d_blocker) * light_size / d_blocker
-//     pcf_radius = clamp(penumbra * texels_per_unit, 0.5, max_radius)
-//
-//   Krok 3 — Variable-radius PCF:
-//     Próbkuj shadow mapę Poissonem w promieniu pcf_radius.
-//     Zwróć średnią widoczność.
-//
-// Rotacja dysku Poissona per-piksel via IGN — eliminuje wzory banding.
-// IGN (Roberts 2016): f(x,y) = fract(52.9829189 * fract(0.06711056*x + 0.00583715*y))
-//
-// Koszt:
-//   quality=0 (PCF 3×3):   9 tapów — najszybszy, twarde cienie
-//   quality=1 (PCSS 16):   16+16=32 tapy — dobry balans real-time
-//   quality=2 (PCSS 32):   16+32=48 tapów — screenshot quality
 // ═════════════════════════════════════════════════════════════════════════════
 
-// ── Poisson disk 16 próbek (van der Corput) ───────────────────────────────
 const POISSON_16 = array<vec2<f32>, 16>(
     vec2<f32>(-0.94201624, -0.39906216),
     vec2<f32>( 0.94558609, -0.76890725),
@@ -319,7 +343,6 @@ const POISSON_16 = array<vec2<f32>, 16>(
     vec2<f32>( 0.14383161, -0.14100790),
 );
 
-// ── Poisson disk 32 próbek (blue-noise distributed) ───────────────────────
 const POISSON_32 = array<vec2<f32>, 32>(
     vec2<f32>(-0.61339800,  0.52506000),
     vec2<f32>( 0.25734900, -0.75584000),
@@ -355,85 +378,62 @@ const POISSON_32 = array<vec2<f32>, 32>(
     vec2<f32>( 0.11590000,  0.21630000),
 );
 
-// ── IGN — Interleaved Gradient Noise (Roberts 2016) ───────────────────────
-// Dobry szum screenspace — brak powtarzającego się wzoru, tani.
 fn ign(px: f32, py: f32) -> f32 {
     return fract(52.9829189 * fract(0.06711056 * px + 0.00583715 * py));
 }
 
-// ── Obrót 2D wektora o kąt angle (radiany) ────────────────────────────────
-// WGSL mat2x2 jest column-major: mat2x2(col0, col1).
-// col0 = (cos, sin), col1 = (-sin, cos) — obrót CCW.
 fn rotate2d(v: vec2<f32>, angle: f32) -> vec2<f32> {
     let c = cos(angle);
     let s = sin(angle);
     return mat2x2<f32>(c, s, -s, c) * v;
 }
 
-// ── Wspólna logika wyboru kaskady i obliczania biasu ──────────────────────
 struct CascadeInfo {
-    cascade:    u32,
-    uv:         vec2<f32>,
-    depth:      f32,    // p.z (NDC depth w shadow space)
-    bias:       f32,
-    valid:      bool,   // false = poza shadow mapą → fully lit
+    cascade: u32,
+    uv:      vec2<f32>,
+    depth:   f32,
+    bias:    f32,
+    valid:   bool,
 }
 
 fn cascade_info(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> CascadeInfo {
     var ci: CascadeInfo;
     ci.valid   = true;
     ci.cascade = 3u;
-
     let near = 0.05;
     let d    = -view_z - near;
-
     if      d < csm.cascade_splits.x { ci.cascade = 0u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y { ci.cascade = 1u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z { ci.cascade = 2u; }
-
     let lp    = csm.light_view_proj[ci.cascade] * vec4<f32>(world_pos, 1.0);
     let p     = lp.xyz / lp.w;
     ci.uv     = vec2<f32>(p.x * 0.5 + 0.5, p.y * -0.5 + 0.5);
     ci.depth  = p.z;
-
     if any(ci.uv < vec2<f32>(0.005)) || any(ci.uv > vec2<f32>(0.995)) {
         ci.valid = false;
         return ci;
     }
-
-    // Adaptacyjny bias: rośnie wykładniczo z indeksem kaskady
     let bias_mult  = max(csm.shadow_params.w, 1.0);
     let bias_scale = pow(bias_mult, f32(ci.cascade));
     ci.bias = max(csm.shadow_params.y * (1.0 - ndl), csm.shadow_params.x) * bias_scale;
-
     return ci;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// [2] CSM Shadow — PCF 3×3 (fallback / quality=0)
-//
-// Zachowany bez zmian — używany gdy shadow_ext.z < 0.5.
-// ─────────────────────────────────────────────────────────────────────────────
 fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
     var cascade = 3u;
     let near    = 0.05;
     let d       = -view_z - near;
-
     if      d < csm.cascade_splits.x { cascade = 0u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y { cascade = 1u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z { cascade = 2u; }
-
     let lp  = csm.light_view_proj[cascade] * vec4<f32>(world_pos, 1.0);
     let p   = lp.xyz / lp.w;
     let uv  = vec2<f32>(p.x * 0.5 + 0.5, p.y * -0.5 + 0.5);
-
     if any(uv < vec2<f32>(0.005)) || any(uv > vec2<f32>(0.995)) { return 1.0; }
-
     let bias_mult  = max(csm.shadow_params.w, 1.0);
     let bias_scale = pow(bias_mult, f32(cascade));
     let bias       = max(csm.shadow_params.y * (1.0 - ndl), csm.shadow_params.x) * bias_scale;
     let texel      = csm.shadow_params.z;
-
     var pcf = 0.0;
     for (var sx = -1; sx <= 1; sx++) {
         for (var sy = -1; sy <= 1; sy++) {
@@ -442,7 +442,6 @@ fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
                                              uv + off, i32(cascade), p.z - bias);
         }
     }
-
     let raw = pcf / 9.0;
     if cascade < 3u {
         let split = select(
@@ -476,75 +475,52 @@ fn csm_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32) -> f32 {
     return raw;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// [PCSS] Krok 1 — Blocker search
-//
-// Szuka fragmentów shadow mapy bliższych niż receiver_depth w promieniu
-// search_r (w texelach). Zwraca średnią głębię blokujących fragmentów
-// lub -1.0 gdy żaden bloker nie znaleziony (= fully lit).
-// Zawsze używa POISSON_16 niezależnie od quality (16 tapów = wystarczy).
-// ─────────────────────────────────────────────────────────────────────────────
 fn blocker_search(
     uv:             vec2<f32>,
     cascade:        u32,
     receiver_depth: f32,
     bias:           f32,
-    search_r:       f32,    // promień w texelach
+    search_r:       f32,
     rotation_angle: f32,
 ) -> f32 {
-    let texel = csm.shadow_params.z;    // 1 / SHADOW_MAP_SIZE
+    let texel         = csm.shadow_params.z;
     var blocker_sum   = 0.0;
     var blocker_count = 0;
-
     for (var i = 0; i < 16; i++) {
-        let s   = rotate2d(POISSON_16[i], rotation_angle);
-        let off = s * search_r * texel;
-        // textureSampleLevel (nie comparison) — pobieramy surową głębię blokera.
-        // Używamy s_ibl (zwykły sampler linear) bo s_shadow jest comparison-only.
-        // t_shadow_map jest texture_depth_2d_array — próbkowanie przez textureLoad.
+        let s          = rotate2d(POISSON_16[i], rotation_angle);
+        let off        = s * search_r * texel;
         let sample_uv  = uv + off;
         let su_clamped = clamp(sample_uv, vec2<f32>(0.001), vec2<f32>(0.999));
         let dims       = vec2<f32>(textureDimensions(t_shadow_map));
         let coord      = vec2<i32>(su_clamped * dims);
         let depth_s    = textureLoad(t_shadow_map, coord, i32(cascade), 0);
-
-        // depth_s < receiver_depth - bias → ten fragment jest blokerem (cień pada na receiver)
         if depth_s < (receiver_depth - bias) {
             blocker_sum   += depth_s;
             blocker_count += 1;
         }
     }
-
-    if blocker_count == 0  { return -1.0; }   // brak blokerów → fully lit
-    if blocker_count == 16 { return -2.0; }   // wszystko zablokowane → fully shadowed
+    if blocker_count == 0  { return -1.0; }
+    if blocker_count == 16 { return -2.0; }
     return blocker_sum / f32(blocker_count);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// [PCSS] Krok 3 — Variable-radius PCF
-//
-// Krok z textureSampleCompareLevel (hardware PCF) w promieniu pcf_r texeli.
-// use_32 = true → 32 próbki (quality=2), false → 16 próbek (quality=1).
-// ─────────────────────────────────────────────────────────────────────────────
 fn variable_pcf(
     uv:             vec2<f32>,
     cascade:        u32,
     receiver_depth: f32,
     bias:           f32,
-    pcf_r:          f32,    // promień w texelach
+    pcf_r:          f32,
     rotation_angle: f32,
     use_32:         bool,
 ) -> f32 {
     let texel = csm.shadow_params.z;
     var sum   = 0.0;
-
     if use_32 {
         for (var i = 0; i < 32; i++) {
             let s   = rotate2d(POISSON_32[i], rotation_angle);
             let off = s * pcf_r * texel;
             sum += textureSampleCompareLevel(t_shadow_map, s_shadow,
-                                             uv + off, i32(cascade),
-                                             receiver_depth - bias);
+                                             uv + off, i32(cascade), receiver_depth - bias);
         }
         return sum / 32.0;
     } else {
@@ -552,68 +528,55 @@ fn variable_pcf(
             let s   = rotate2d(POISSON_16[i], rotation_angle);
             let off = s * pcf_r * texel;
             sum += textureSampleCompareLevel(t_shadow_map, s_shadow,
-                                             uv + off, i32(cascade),
-                                             receiver_depth - bias);
+                                             uv + off, i32(cascade), receiver_depth - bias);
         }
         return sum / 16.0;
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// [PCSS] Główna funkcja — dispatch + cascade blend
-//
-// shadow_ext: x=light_size  y=max_radius_texels  z=quality  w=_pad
-//
-// Gdy quality < 0.5 → deleguje do csm_shadow() (PCF 3×3).
-// Gdy quality >= 0.5 → PCSS z 16 lub 32 próbkami.
-//
-// Cascade blend działa tak samo jak w csm_shadow() — płynne przejście
-// między kaskadami na ostatnich 10% zakresu każdej kaskady.
-// ─────────────────────────────────────────────────────────────────────────────
-fn pcss_shadow(
-    world_pos:  vec3<f32>,
-    view_z:     f32,
-    ndl:        f32,
-    pixel_xy:   vec2<f32>,  // @builtin(position).xy — do IGN
+fn pcss_single_cascade(
+    uv:         vec2<f32>,
+    cascade:    u32,
+    recv_depth: f32,
+    bias:       f32,
+    light_size: f32,
+    max_r:      f32,
+    rot_angle:  f32,
+    use_32:     bool,
 ) -> f32 {
+    let search_r    = clamp(light_size * 4.0, 2.0, max_r * 2.0);
+    let avg_blocker = blocker_search(uv, cascade, recv_depth, bias, search_r, rot_angle);
+    if avg_blocker < -1.5 { return 0.0; }
+    if avg_blocker < 0.0  { return 1.0; }
+    let texel    = csm.shadow_params.z;
+    let penumbra = (recv_depth - avg_blocker) * light_size / max(avg_blocker, 0.001);
+    let pcf_r    = clamp(penumbra / texel, 0.5, max_r);
+    return variable_pcf(uv, cascade, recv_depth, bias, pcf_r, rot_angle, use_32);
+}
+
+fn pcss_shadow(world_pos: vec3<f32>, view_z: f32, ndl: f32, pixel_xy: vec2<f32>) -> f32 {
     let quality    = csm.shadow_ext.z;
     let light_size = csm.shadow_ext.x;
     let max_r      = csm.shadow_ext.y;
-
-    // Fallback do oryginalnego PCF 3×3
     if quality < 0.5 {
         return csm_shadow(world_pos, view_z, ndl);
     }
-
-    let use_32 = quality > 1.5;
-
-    // Per-piksel rotacja dysku Poissona — eliminuje wzory banding
+    let use_32    = quality > 1.5;
     let rot_angle = ign(pixel_xy.x, pixel_xy.y) * (2.0 * PI);
-
-    // Wybierz kaskadę
-    var cascade = 3u;
-    let near    = 0.05;
-    let d       = -view_z - near;
+    var cascade   = 3u;
+    let near      = 0.05;
+    let d         = -view_z - near;
     if      d < csm.cascade_splits.x { cascade = 0u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y { cascade = 1u; }
     else if d < csm.cascade_splits.x + csm.cascade_splits.y + csm.cascade_splits.z { cascade = 2u; }
-
-    // Oblicz shadow-space pozycję
     let lp  = csm.light_view_proj[cascade] * vec4<f32>(world_pos, 1.0);
     let p   = lp.xyz / lp.w;
     let uv  = vec2<f32>(p.x * 0.5 + 0.5, p.y * -0.5 + 0.5);
-
     if any(uv < vec2<f32>(0.005)) || any(uv > vec2<f32>(0.995)) { return 1.0; }
-
-    // Bias (identyczny z csm_shadow)
     let bias_mult  = max(csm.shadow_params.w, 1.0);
     let bias_scale = pow(bias_mult, f32(cascade));
     let bias       = max(csm.shadow_params.y * (1.0 - ndl), csm.shadow_params.x) * bias_scale;
-
-    let vis = pcss_single_cascade(uv, cascade, p.z, bias, light_size, max_r,
-                                   rot_angle, use_32);
-
-    // Cascade blend (ostatnie 10% zakresu kaskady)
+    let vis        = pcss_single_cascade(uv, cascade, p.z, bias, light_size, max_r, rot_angle, use_32);
     if cascade < 3u {
         let split = select(
             csm.cascade_splits.x,
@@ -631,46 +594,12 @@ fn pcss_shadow(
             let p2   = lp2.xyz / lp2.w;
             let uv2  = vec2<f32>(p2.x * 0.5 + 0.5, p2.y * -0.5 + 0.5);
             if all(uv2 >= vec2<f32>(0.005)) && all(uv2 <= vec2<f32>(0.995)) {
-                let vis2 = pcss_single_cascade(uv2, next, p2.z, next_bias,
-                                               light_size, max_r, rot_angle, use_32);
+                let vis2 = pcss_single_cascade(uv2, next, p2.z, next_bias, light_size, max_r, rot_angle, use_32);
                 return mix(vis, vis2, blend_t);
             }
         }
     }
-
     return vis;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// [PCSS] Jeden przebieg PCSS dla jednej kaskady
-// ─────────────────────────────────────────────────────────────────────────────
-fn pcss_single_cascade(
-    uv:         vec2<f32>,
-    cascade:    u32,
-    recv_depth: f32,
-    bias:       f32,
-    light_size: f32,
-    max_r:      f32,
-    rot_angle:  f32,
-    use_32:     bool,
-) -> f32 {
-    // Krok 1: Blocker search
-    // search_radius w texelach: większy light_size → szersze przeszukiwanie
-    let search_r = clamp(light_size * 4.0, 2.0, max_r * 2.0);
-    let avg_blocker = blocker_search(uv, cascade, recv_depth, bias, search_r, rot_angle);
-
-    if avg_blocker < -1.5 { return 0.0; }   // fully shadowed
-    if avg_blocker < 0.0  { return 1.0; }   // fully lit (brak blokerów)
-
-    // Krok 2: Penumbra — szerokość penumbry w texelach
-    // penumbra = (d_receiver - d_blocker) * light_size / d_blocker
-    // * (1/texel_size) konwertuje do texeli (texel_size = 1/2048)
-    let texel     = csm.shadow_params.z;
-    let penumbra  = (recv_depth - avg_blocker) * light_size / max(avg_blocker, 0.001);
-    let pcf_r     = clamp(penumbra / texel, 0.5, max_r);
-
-    // Krok 3: Variable-radius PCF
-    return variable_pcf(uv, cascade, recv_depth, bias, pcf_r, rot_angle, use_32);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -708,22 +637,22 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
 
     let perc_rough = specular_aa_roughness(n, raw_roughness);
 
-    let ndv = max(dot(n, v), EPSILON);
-    let ior = max(material.ext_ior_trans.x, 1.001);
-    let f0d = vec3<f32>(f0_from_ior(ior)) * material.ext_specular_color.xyz * material.ext_ior_trans.w;
-    let f0  = mix(f0d, albedo, metallic);
-    let dc  = albedo * (1.0 - metallic);
+    let ndv     = max(dot(n, v), EPSILON);
+    let ior     = max(material.ext_ior_trans.x, 1.001);
+    let f0d     = vec3<f32>(f0_from_ior(ior)) * material.ext_specular_color.xyz * material.ext_ior_trans.w;
+    let f0      = mix(f0d, albedo, metallic);
+    let dc      = albedo * (1.0 - metallic);
     let trans_m = clamp(material.ext_ior_trans.y * (1.0 - metallic), 0.0, 1.0);
     let diff_en = max(1.0 - trans_m, 0.0);
-    let irid = iridescence_tint(ndv, material.ext_iridescence.x,
-                                material.ext_iridescence.y, material.ext_iridescence.z);
+    let irid    = iridescence_tint(ndv, material.ext_iridescence.x,
+                                   material.ext_iridescence.y, material.ext_iridescence.z);
 
     let ani = clamp(material.advanced.x, -1.0, 1.0);
     let rot = material.advanced.y;
     let cr  = cos(rot);
     let sr  = sin(rot);
     var T_a = normalize(T0 * cr + B0 * sr);
-    T_a = normalize(T_a - n * dot(T_a, n));
+    T_a     = normalize(T_a - n * dot(T_a, n));
     let B_a = normalize(cross(n, T_a));
     let at  = max(perc_rough * (1.0 + ani), 0.045);
     let ab  = max(perc_rough * (1.0 - ani), 0.045);
@@ -786,8 +715,6 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
 
         var shd = 1.0;
         if is_sun {
-            // [PCSS] Użyj pcss_shadow zamiast csm_shadow.
-            // Dispatch do PCF 3×3 lub PCSS w zależności od shadow_ext.z.
             shd = pcss_shadow(in.world_pos, in.view_pos.z, ndl, in.clip_pos.xy);
         }
 
@@ -833,6 +760,7 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
 
     lo += lights.ambient.rgb * dc * (1.0 - metallic) * ao * INV_PI * diff_en;
 
+    // [KC] IBL z multiscatter
     var ambient = ibl(n, v, f0, dc, metallic, perc_rough, ao, trans_m, irid);
 
     if clearcoat > 0.001 {
@@ -842,8 +770,10 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
         let r_cc_rot = (env.rotation * vec4<f32>(reflect(-v, N_geom), 0.0)).xyz;
         let lod_cc   = cc_perc_rough * MAX_PREFILTER_LOD;
         let env_cc   = textureSampleLevel(t_prefilter, s_ibl, r_cc_rot, lod_cc).rgb * IBL_SCALE;
-        let brdf_cc  = textureSample(t_brdf_lut, s_lut, vec2<f32>(cc_ndv, cc_perc_rough)).rg;
+        // [KC] clearcoat również korzysta z nowego brdf (rg = split-sum, b = Ess)
+        let brdf_cc  = textureSample(t_brdf_lut, s_lut, vec2<f32>(cc_ndv, cc_perc_rough));
         let s_occ_cc = specular_occlusion(cc_ndv, ao);
+        // Clearcoat: F0=0.04, brak multiscatter (clearcoat = dielektryk, ms pomijalne)
         ambient     += env_cc * (vec3<f32>(0.04) * brdf_cc.x + brdf_cc.y) * clearcoat * s_occ_cc * irid;
     }
 

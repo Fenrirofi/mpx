@@ -11,7 +11,7 @@ use rand::rngs::SmallRng;
 use rand::SeedableRng;
 use wgpu::util::DeviceExt;
 
-pub const KERNEL_SIZE: usize = 32;
+pub const KERNEL_SIZE: usize = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]

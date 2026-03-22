@@ -42,7 +42,7 @@ impl Default for ShadowSettings {
         Self {
             light_size:        1.5,
             max_radius_texels: 8.0,
-            quality:           1.0,
+            quality:           0.0,
         }
     }
 }

@@ -175,10 +175,10 @@ impl SsrRenderer {
             inv_proj: proj.inverse().to_cols_array_2d(),
             view: view.to_cols_array_2d(),
             texel_size: [1.0 / self.width as f32, 1.0 / self.height as f32],
-            max_steps: 48,
+            max_steps: 24,
             max_distance: 50.0,
             thickness: 0.3,
-            stride: 0.015,
+            stride: 0.04,
             _pad: [0.0; 2],
         };
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));

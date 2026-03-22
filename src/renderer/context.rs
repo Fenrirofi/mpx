@@ -263,6 +263,7 @@ impl RenderContext {
         ibl_sampler:     &wgpu::Sampler,
         lut_sampler:     &wgpu::Sampler,
         env_uniform_buf: &wgpu::Buffer,
+        eavg_view:       &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("lights_shadow_ibl_bg"),
@@ -278,6 +279,7 @@ impl RenderContext {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(ibl_sampler) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(lut_sampler) },
                 wgpu::BindGroupEntry { binding: 9, resource: env_uniform_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(eavg_view) },  // [KC]
             ],
         })
     }
@@ -385,6 +387,7 @@ impl RenderContext {
             &device, &lights_shadow_bgl, &lights_uniform_buf, &shadow,
             &fallback_cube_view, &fallback_cube_view, &fallback_lut_view,
             &fallback_sampler, &fallback_sampler, &env_uniform_buf,
+            &fallback_lut_view,   // [KC] eavg fallback — 1×1 biała tekstura wystarczy
         );
 
         let mut ctx = Self {
@@ -420,6 +423,7 @@ impl RenderContext {
             &self.device, &self.lights_shadow_bgl, &self.lights_uniform_buf, &self.shadow,
             &maps.irradiance_view, &maps.prefilter_view, &maps.brdf_lut_view,
             &maps.sampler, &maps.lut_sampler, &self.env_uniform_buf,
+            &maps.eavg_lut_view,  // [KC]
         );
         self.ibl = Some(maps);
         log::info!("IBL loaded — PBR ambient/specular aktywny.");
